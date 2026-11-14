@@ -1,6 +1,9 @@
 # build output / environments
-firmware/.pio/
+firmware/.pio
 tools/.venv/
+tools/.pio-venv/
+tools/.art-cache/
+tools/.run-logs/
 __pycache__/
 .pytest_cache/
 .DS_Store

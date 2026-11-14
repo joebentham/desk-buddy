@@ -24,12 +24,13 @@ plays back at 24 fps.
   8 MB PSRAM, 240×240 ST7789 behind a glass cube, motion sensor for taps). Lump was built on
   [this AliExpress listing](https://www.aliexpress.com/item/1005009887388696.html), colour option
   **ESP32-S3-LCD-1.3-C** (about $20). Keep its stock case: the mount is sized for it.
+  A 3.2 inch ESP32-32E resistive-touch board is also supported; see [ESP32-32E](#esp32-32e).
 - **A USB-C data cable** for the first flash. After Wi-Fi setup he only needs power.
-- **A Mac.** The bridge that connects Claude to Lump is macOS-only (launchd, a small Swift helper,
-  `afplay`). The firmware itself doesn't care.
+- **A Mac or Linux PC.** The bridge connects Claude Code to Lump on either.
+  Claude desktop app tracking and the menu bar Lump are macOS-only.
 - **Claude Code**, plus optionally the Claude desktop app (for Chat and Cowork states).
-- [PlatformIO](https://platformio.org/) (`brew install platformio`), Python 3, and the Xcode
-  command line tools (`xcode-select --install`).
+- [PlatformIO](https://platformio.org/) (`brew install platformio` on a Mac) and Python 3.
+  On macOS, also install the Xcode command line tools (`xcode-select --install`).
 - Optional: a 3D printer for the [monitor mount](enclosure/print/), which holds him on the back of your monitor, peeking over the top.
 
 ## Setup
@@ -39,7 +40,7 @@ git clone https://github.com/joebentham/desk-buddy.git
 cd desk-buddy
 ```
 
-**1. Flash the board.** Plug it in with a data cable, then:
+**1. Flash the board.** For the S3 prism, plug it in with a data cable, then:
 
 ```bash
 tools/flash.sh
@@ -48,15 +49,17 @@ tools/flash.sh
 This builds the firmware and writes it plus Lump's drawings (~11 MB; the drawings take about
 5 minutes). It uses a paced esptool upload because macOS drops bytes from big bursts to
 this board's USB-serial chip, so plain `pio run -t upload` fails.
+For ESP32-32E, follow the [board guide](docs/esp32-32e.md#build-and-flash) instead.
 
 **2. Install the bridge.** A small Python service that listens to Claude and drives Lump, plus
-a helper that reads the Claude app's window (Chat and Cowork have no hooks). Both run as login items.
+on macOS, a helper that reads the Claude app's window (Chat and Cowork have no hooks).
+Both run as login items on macOS; Linux uses a systemd user service.
 
 ```bash
 tools/install_bridge.sh
 ```
 
-When macOS asks, allow `deskbuddy-appwatch` under System Settings → Privacy & Security →
+On Linux, see [Linux setup](#linux) below. When macOS asks, allow `deskbuddy-appwatch` under System Settings → Privacy & Security →
 Accessibility. Everything it installs lives in `~/.desk-buddy`.
 
 **3. Hook up Claude Code.** Adds small async hooks to `~/.claude/settings.json` that tell the
@@ -75,13 +78,55 @@ Start a Claude Code session and Lump should wake up.
 ~/.desk-buddy/venv/bin/python tools/wifi_setup.py
 ```
 
-Your Wi-Fi password goes straight into the board over USB and is never saved on the Mac. After
+Your Wi-Fi password goes straight into the board over USB and is never saved on the host. After
 this he joins your network as `lump.local`, keeps time from the internet, and can live on any USB
-charger, such as a monitor's power-only port. Updates then go over the air:
+charger, such as a monitor's power-only port. S3 updates then go over the air:
 
 ```bash
 python3 tools/ota.py
 ```
+
+ESP32-32E updates use USB; see the [board guide](docs/esp32-32e.md).
+
+### ESP32-32E
+
+The `esp32-32e` target supports the classic ESP32 with 4 MB flash, an
+ILI9341-compatible 320×240 panel and XPT2046 resistive touch. Lump plays at
+120×120 and 8 fps, doubled to 240×240, with session counts in a band below.
+Press anywhere for a gag. Firmware and art updates use USB; OTA is disabled
+to leave room for the drawings. See the [board guide](docs/esp32-32e.md) for
+pins, art conversion, backup, flashing and live touch/display tuning.
+
+### Linux
+
+Requires Python 3 with venv/pip support (`python3-venv` on Debian), systemd user
+services, and `curl` plus `/usr/bin/jq` for the hooks and status line. For USB
+access, add yourself to `dialout` and log out and back in:
+
+```bash
+sudo usermod -aG dialout "$USER"
+```
+
+With systemd lingering, the user manager can outlive a login, so a reboot may
+be needed for the new group to reach user services.
+
+```bash
+tools/install_bridge.sh --dry-run
+tools/install_bridge.sh
+python3 tools/install_hooks.py
+systemctl --user status deskbuddy-bridge.service
+```
+
+The installer puts the runtime in `~/.desk-buddy` and starts the bridge at login.
+Use `journalctl --user -u deskbuddy-bridge.service -f` for logs;
+`tools/install_bridge.sh --uninstall` removes the service and keeps settings.
+USB discovery prefers stable by-id paths. With several boards, set
+`DESKBUDDY_PORT` to the intended device (in a systemd service override for the
+installed bridge). Wi-Fi setup also accepts `PORT` for an explicit USB device.
+
+Sounds use `pw-play`, `paplay` or `aplay`, in that order, when available in your
+user audio session. Linux receives Claude Code hooks and usage status lines;
+the Swift Chat/Cowork watcher and menu bar app run on macOS.
 
 ### Optional extras
 
@@ -140,7 +185,7 @@ stays small (it has a 12 MB budget). Keep faces simple: dot eyes, small mouths, 
 ```
 Claude Code hooks ─┐
 status line ───────┤                           USB serial or Wi-Fi
-Claude app window ─┼─▶ bridge (Mac, :47823) ─────────────────────▶ ESP32 prism: Lump
+Claude app (Mac) ──┼─▶ bridge (Mac/Linux, :47823) ────────────────▶ ESP32 display: Lump
 calendar / Slack ──┘   one mood for all sessions                   plays baked frames, senses taps
 ```
 
@@ -149,12 +194,12 @@ calendar / Slack ──┘   one mood for all sessions                   plays b
 | `firmware/src/main.cpp` | The frame player: moods, transitions, taps, offline mode, Wi-Fi, OTA. The serial protocol is documented at the top. |
 | `firmware/data/lump.bin` | Lump's baked frames (written to their own flash partition) |
 | `design/lump.html` | Lump himself: every drawing and animation |
-| `tools/buddy_bridge.py` | The bridge: Claude hooks, app state, usage, calendar, Slack, sounds → one mood |
+| `tools/buddy_bridge.py`, `tools/bridge_host.py` | The bridge: Claude hooks, app state (Mac), usage, calendar, Slack, sounds → one mood; serial and service support |
 | `tools/appwatch/` | Swift helper that reads Chat/Cowork state from the Claude app's accessibility tree |
 | `tools/lumpbar/` | Lump on your Mac: frame baker (`bake.py`) and the notch/menu bar app (`main.swift`) |
 | `tools/flash.sh`, `tools/ota.py`, `tools/wifi_setup.py` | Getting firmware and drawings onto the board |
 | `enclosure/` | OpenSCAD source for the adjustable monitor mount, with [ready-to-print STLs](enclosure/print/) |
-| `tests/` | Bridge tests (no board needed): `~/.desk-buddy/venv/bin/python -m unittest discover -s tests` |
+| `tests/` | Bridge, mocked flash, art and firmware host tests (no board needed): `python3 -m pytest -q`; needs pytest, pyserial and host `g++` with ASan/UBSan |
 
 The bridge's debug endpoints help when you're poking at him: `curl 127.0.0.1:47823/status`, or
 `curl -X POST --data "e tap" 127.0.0.1:47823/cmd` to send a raw command. To play an animation on

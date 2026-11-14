@@ -7,7 +7,10 @@ folder and given fake device / focus / sound objects.
 """
 import importlib.util, json, os, sys, tempfile, time, unittest
 from unittest import mock
+from serial.tools import list_ports
+from serial_fakes import Clock as USBClock, MISSING_ART_BOOT, MISSING_ART_STATE, USB
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 HOME = tempfile.mkdtemp(prefix="deskbuddy-test-")
 os.environ["DESKBUDDY_HOME"] = HOME
 _spec = importlib.util.spec_from_file_location(
@@ -322,6 +325,7 @@ class DeviceLinks(unittest.TestCase):
     def device(self):
         d = bridge.Device.__new__(bridge.Device)               # no thread, no real ports
         d._last_err = {}
+        d.ser, d.link, d._usb_identity, d.lock = None, None, None, bridge.threading.Lock()
         return d
 
     def write_config(self, cfg):
@@ -350,12 +354,234 @@ class DeviceLinks(unittest.TestCase):
             d._fail("socket://lump.local:4210", OSError("refused"))
         self.assertEqual(len(logs.output), 2)
 
+    def test_explicit_port_overrides_discovery_and_wifi(self):
+        with mock.patch.dict(os.environ, {"DESKBUDDY_PORT": "/dev/fake-buddy"}), \
+             mock.patch.object(bridge.Device, "usb_ports", side_effect=AssertionError("discovery")):
+            self.assertEqual(self.device()._targets(), ["/dev/fake-buddy"])
+
+    def test_mac_usb_open_keeps_the_protocol_and_requests_no_reset(self):
+        clock = USBClock()
+        port = USB(clock)
+        with mock.patch.object(bridge.sys, "platform", "darwin"), \
+             mock.patch.object(bridge.time, "monotonic", clock), \
+             mock.patch.object(bridge, "usb_identity", return_value=("path", "/dev/fake-buddy")), \
+             mock.patch.object(bridge.Device, "_targets", return_value=["/dev/fake-buddy"]), \
+             mock.patch.object(bridge.serial, "Serial", return_value=port):
+            self.assertIs(self.device()._open(), port)
+        self.assertEqual((port.port, port.baudrate, port.timeout), ("/dev/fake-buddy", 115200, 0.3))
+        self.assertIs(port.dtr, False)
+        self.assertIs(port.rts, False)
+        self.assertTrue(port.opened and not port.closed)
+        self.assertEqual(set(port.writes), {b"?\n"})
+
+    def test_mac_probes_adapters_after_rejecting_an_unrelated_modem(self):
+        for path in ("/dev/cu.usbserial-0001", "/dev/cu.wchusbserial0001"):
+            with self.subTest(port=path):
+                d, clock = self.device(), USBClock()
+                alien, lump = USB(clock, response=b"ok generic\n"), USB(clock, boot=4.8)
+                with mock.patch.object(bridge.sys, "platform", "darwin"), \
+                     mock.patch.object(bridge.time, "monotonic", clock), \
+                     mock.patch.object(bridge, "read_config", return_value={}), \
+                     mock.patch.dict(os.environ, {}, clear=True), \
+                     mock.patch.object(d, "usb_ports", return_value=["/dev/cu.usbmodem0", path]), \
+                     mock.patch.object(bridge, "usb_identity", side_effect=lambda p: ("path", p)), \
+                     mock.patch.object(bridge.serial, "Serial", side_effect=[alien, lump]):
+                    self.assertIs(d._open(), lump)
+                self.assertTrue(alien.closed and lump.opened and not lump.closed)
+                self.assertEqual((lump.port, d.link, d._usb_identity), (path, "usb", ("path", path)))
+                self.assertEqual(set(alien.writes + lump.writes), {b"?\n"})
+
+    def test_linux_opens_lump_with_missing_or_bad_art(self):
+        d, clock = self.device(), USBClock()
+        lump = USB(clock, boot=1.9, response=MISSING_ART_STATE)
+        lump.pending = [MISSING_ART_BOOT]
+        with mock.patch.object(bridge.sys, "platform", "linux"), \
+             mock.patch.object(bridge.time, "monotonic", clock), \
+             mock.patch.object(d, "_targets", return_value=["/fake/lump"]), \
+             mock.patch.object(bridge, "usb_identity", return_value=("path", "/fake/lump")), \
+             mock.patch.object(bridge.serial, "Serial", return_value=lump):
+            self.assertIs(d._open(), lump)
+        self.assertTrue(lump.opened and not lump.closed)
+        self.assertGreater(clock(), 1.9)
+        self.assertEqual(d.link, "usb")
+        self.assertEqual(set(lump.writes), {b"?\n"})
+
+    def test_linux_serial_identity_ignores_unrelated_adapter_and_reconnects(self):
+        d, clock = self.device(), USBClock()
+        path, unrelated = "/dev/serial/by-id/usb-lump", "/dev/serial/by-id/usb-unrelated"
+        first, alien, replugged = USB(clock, boot=1.8), USB(clock), USB(clock, boot=3.7)
+        with mock.patch.object(bridge.sys, "platform", "linux"), \
+             mock.patch.object(bridge.time, "monotonic", clock), \
+             mock.patch.object(bridge, "read_config", return_value={}), \
+             mock.patch.object(bridge, "usb_identity", side_effect=lambda p: ("serial_number", 0x1A86, 0x7523, p)), \
+             mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(d, "usb_ports", return_value=[path, unrelated]), \
+                 mock.patch.object(bridge.serial, "Serial", return_value=first):
+                self.assertIs(d._open(), first)
+            d.ser = first
+            d._drop("fake unplug")  # the unrelated adapter remains
+            self.assertTrue(first.closed)
+            with mock.patch.object(d, "usb_ports", return_value=[unrelated]), \
+                 mock.patch.object(bridge.serial, "Serial", return_value=alien) as serial:
+                self.assertIsNone(d._open())
+                serial.assert_not_called()
+            with mock.patch.object(d, "usb_ports", return_value=[unrelated, path]), \
+                 mock.patch.object(bridge.serial, "Serial", return_value=replugged):
+                self.assertIs(d._open(), replugged)
+        self.assertEqual(d.link, "usb")
+        self.assertEqual(set(first.writes + replugged.writes), {b"?\n"})
+
+    def test_linux_serialless_ch340_moves_socket_and_adopts_only_verified_identity(self):
+        for location in ("1-2", None):
+            with self.subTest(identity="location" if location else "path"):
+                d, clock = self.device(), USBClock()
+                port = mock.Mock(device="/fake/ttyUSB0", vid=0x1A86, pid=0x7523,
+                                 serial_number=None, location=location, description="CH340")
+                other = mock.Mock(device="/fake/ttyUSB1", vid=0x1A86, pid=0x7523,
+                                  serial_number=None, location="1-3" if location else None, description="CH340")
+                first, rejected, alien, moved = (USB(clock), USB(clock, response=b"ok generic\n"),
+                                                  USB(clock, response=b"ok generic\n"), USB(clock))
+                with mock.patch.object(bridge.sys, "platform", "linux"), \
+                     mock.patch.object(bridge.time, "monotonic", clock), \
+                     mock.patch.object(bridge, "read_config", return_value={}), \
+                     mock.patch.dict(os.environ, {}, clear=True), \
+                     mock.patch.object(list_ports, "comports", return_value=[port, other]):
+                    with mock.patch.object(d, "usb_ports", return_value=[port.device]), \
+                         mock.patch.object(bridge.serial, "Serial", return_value=first):
+                        self.assertIs(d._open(), first)
+                    old_identity = d._usb_identity
+                    self.assertEqual(old_identity[0], "location" if location else "path")
+                    d.ser = first
+                    d._drop("fake unplug")
+                    port.device, port.location = "/fake/ttyUSB3", "1-4" if location else None
+                    with mock.patch.object(d, "usb_ports", return_value=[other.device]), \
+                         mock.patch.object(bridge.serial, "Serial", return_value=rejected):
+                        self.assertIsNone(d._open())
+                    self.assertTrue(rejected.closed)
+                    self.assertEqual(d._usb_identity, old_identity)
+                    with mock.patch.object(d, "usb_ports", return_value=[other.device, port.device]), \
+                         mock.patch.object(bridge.serial, "Serial", side_effect=[alien, moved]):
+                        self.assertIs(d._open(), moved)
+                        self.assertNotEqual(d._usb_identity, old_identity)
+                        self.assertEqual(d._usb_identity, bridge.usb_identity(port.device))
+                        self.assertEqual(d._targets(), [port.device, other.device])
+                self.assertTrue(first.closed and alien.closed and not moved.closed)
+                self.assertEqual(d.link, "usb")
+                self.assertEqual(set(first.writes + rejected.writes + alien.writes + moved.writes), {b"?\n"})
+
+    def test_linux_raw_tty_reconnects_through_late_by_id_alias(self):
+        for field in ("serial_number", "location", None):
+            with self.subTest(identity=field):
+                d, clock = self.device(), USBClock()
+                alias = "/dev/serial/by-id/usb-lump"
+                port = mock.Mock(device="/dev/ttyUSB0", vid=0x1A86, pid=0x7523,
+                                 serial_number="lump-123" if field == "serial_number" else None,
+                                 location="1-2" if field else None, description="CH340")
+                aliases = []
+                first, replugged = USB(clock), USB(clock)
+
+                def glob(pattern):
+                    return {"/dev/serial/by-id/*": aliases, "/dev/ttyUSB*": [port.device],
+                            "/dev/ttyACM*": []}[pattern]
+
+                realpath = os.path.realpath
+                with mock.patch.object(bridge.sys, "platform", "linux"), \
+                     mock.patch.object(bridge.time, "monotonic", clock), \
+                     mock.patch.object(bridge, "read_config", return_value={}), \
+                     mock.patch.dict(os.environ, {}, clear=True), \
+                     mock.patch.object(bridge.glob, "glob", side_effect=glob), \
+                     mock.patch.object(list_ports, "comports", return_value=[port]), \
+                     mock.patch.object(os.path, "realpath", side_effect=lambda p:
+                                       port.device if p == alias else realpath(p)), \
+                     mock.patch.object(bridge.serial, "Serial", side_effect=[first, replugged]):
+                    self.assertEqual(d.usb_ports(), [port.device])
+                    self.assertIs(d._open(), first)
+                    d.ser = first
+                    d._drop("fake unplug before udev creates the alias")
+                    # USB metadata preserves identity through tty renumbering.
+                    if field:
+                        port.device = "/dev/ttyUSB3"
+                    aliases.append(alias)
+                    self.assertEqual(d.usb_ports(), [alias])  # discovery deduplicates the raw tty
+                    self.assertIs(d._open(), replugged)
+                self.assertTrue(first.closed)
+                self.assertEqual(d.link, "usb")
+                self.assertTrue(first.writes and replugged.writes)
+                self.assertEqual(set(first.writes + replugged.writes), {b"?\n"})
+
+    def test_linux_rejected_usb_is_closed_before_wifi_fallback(self):
+        d, clock = self.device(), USBClock()
+        alien, net = USB(clock, response=b"ok generic\n"), mock.Mock(_socket=None)
+        with mock.patch.object(bridge.sys, "platform", "linux"), \
+             mock.patch.object(bridge.time, "monotonic", clock), \
+             mock.patch.object(d, "_targets", return_value=["/fake/unrelated", "socket://127.0.0.1:4210"]), \
+             mock.patch.object(bridge, "read_config", return_value={"lump_token": "fake-token"}), \
+             mock.patch.object(bridge.serial, "Serial", return_value=alien), \
+             mock.patch.object(bridge.serial, "serial_for_url", return_value=net), \
+             mock.patch("socket.getaddrinfo", return_value=[(None, None, None, None, ("127.0.0.1", 4210))]):
+            self.assertIs(d._open(), net)
+        self.assertTrue(alien.closed)
+        self.assertEqual(d.link, "wifi")
+        self.assertEqual(set(alien.writes), {b"?\n"})
+
+    def test_unverified_usb_does_not_displace_working_wifi(self):
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                self.check_unverified_usb_keeps_wifi(platform)
+
+    def check_unverified_usb_keeps_wifi(self, platform):
+        d, clock = self.device(), USBClock()
+        net, alien = mock.Mock(), USB(clock, response=b"ok generic\n")
+        d.ser, d.link = net, "wifi"
+        net.read.side_effect = KeyboardInterrupt
+        with mock.patch.object(bridge.sys, "platform", platform), \
+             mock.patch.object(bridge.time, "monotonic", clock), \
+             mock.patch.object(bridge.time, "time", return_value=100), \
+             mock.patch.object(bridge, "read_config", return_value={}), \
+             mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(d, "usb_ports", return_value=["/fake/unrelated"]), \
+             mock.patch.object(bridge.serial, "Serial", return_value=alien), \
+             mock.patch.object(d, "_drop", side_effect=AssertionError("unverified USB displaced Wi-Fi")) as drop:
+            with self.assertRaises(KeyboardInterrupt):
+                d._run()
+        drop.assert_not_called()
+        net.close.assert_not_called()
+        self.assertTrue(alien.closed)
+
+    def test_verified_usb_replaces_wifi_after_probe(self):
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                self.check_verified_usb_replaces_wifi(platform)
+
+    def check_verified_usb_replaces_wifi(self, platform):
+        d, clock = self.device(), USBClock()
+        net, lump = mock.Mock(), USB(clock, boot=1.8)
+        d.ser, d.link = net, "wifi"
+        d.on_ready = mock.Mock(side_effect=KeyboardInterrupt)
+        with mock.patch.object(bridge.sys, "platform", platform), \
+             mock.patch.object(bridge.time, "monotonic", clock), \
+             mock.patch.object(bridge.time, "time", return_value=100), \
+             mock.patch.object(bridge, "read_config", return_value={}), \
+             mock.patch.object(bridge, "usb_identity", side_effect=lambda p: ("path", p)), \
+             mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(d, "usb_ports", return_value=["/dev/serial/by-id/usb-lump"]), \
+             mock.patch.object(bridge.serial, "Serial", return_value=lump):
+            with self.assertRaises(KeyboardInterrupt):
+                d._run()
+        self.assertGreaterEqual(clock(), 1.8)
+        self.assertEqual(set(lump.writes), {b"?\n"})
+        net.close.assert_called_once_with()
+        self.assertIs(d.ser, lump)
+        self.assertEqual(d.link, "usb")
+
 
 class GagSoundTest(unittest.TestCase):
     """The board says "gag tap_<gag>_<mood>" when a gag starts; the bridge plays tap_<gag>.wav in step."""
 
     def setUp(self):
         import wave
+        platform = mock.patch.object(bridge.sys, "platform", "darwin")
+        platform.start(); self.addCleanup(platform.stop)
         self.dir = tempfile.mkdtemp(prefix="deskbuddy-sounds-")
         for g in ("shock", "prep", "prep_alarm", "startle"):
             with wave.open(os.path.join(self.dir, f"tap_{g}.wav"), "wb") as w:
@@ -420,6 +646,122 @@ class GagSoundTest(unittest.TestCase):
         with mock.patch.object(bridge.time, "time", return_value=NOON):
             b.board_line("gag tap_moon_idle")
         self.assertEqual(b.sounds.played, ["tap_moon_idle"])
+
+    def test_linux_gag_uses_pipewire_volume_and_compensates_startup_lag(self):
+        self.write({"enabled": True, "volume": 0.4, "player_lag": 0.12})
+        with mock.patch.object(bridge.sys, "platform", "linux"), \
+             mock.patch.object(bridge.shutil, "which", return_value="/usr/bin/pw-play"):
+            self.s = bridge.Sounds()
+        self.assertTrue(self.s.play_gag("tap_shock_idle"))
+        delay, cmd = self.fire()
+        self.assertAlmostEqual(delay, bridge.GAG_LEAD - 0.12)
+        self.assertEqual(cmd, ["pw-play", "--volume", "0.4", os.path.join(self.dir, "tap_shock.wav")])
+        self.write({"enabled": True, "volume": 0.7})
+        self.assertEqual(self.fire()[1][2], "0.7")
+
+    def test_linux_moments_use_the_selected_player_too(self):
+        self.write({"enabled": True, "volume": 0.4, "moments": {"thanks": {"on": True, "pick": ["a"]}}})
+        path = os.path.join(self.dir, "thanks_a.wav")
+        open(path, "wb").close()
+        with mock.patch.object(bridge.sys, "platform", "linux"), \
+             mock.patch.object(bridge.shutil, "which", side_effect=lambda p: p if p == "paplay" else None), \
+             mock.patch.object(bridge.subprocess, "Popen") as popen:
+            self.s = bridge.Sounds()
+            self.assertTrue(self.s.play("thanks"))
+        self.assertEqual(popen.call_args.args[0], ["paplay", "--volume", "48287", path])
+
+
+class SoundPlayers(unittest.TestCase):
+    def test_linux_player_preference_and_volume_units(self):
+        for available, expected in (
+                ({"pw-play", "paplay", "aplay"}, ["pw-play", "--volume", "0.5", "voice.wav"]),
+                ({"paplay", "aplay"}, ["paplay", "--volume", "52016", "voice.wav"]),
+                ({"aplay"}, ["aplay", "-q", "voice.wav"])):
+            with self.subTest(available=available), mock.patch.object(bridge.sys, "platform", "linux"), \
+                 mock.patch.object(bridge.shutil, "which", side_effect=lambda p: p if p in available else None), \
+                 mock.patch.object(bridge.subprocess, "Popen") as popen:
+                sounds = bridge.Sounds()
+                self.assertTrue(sounds._play_file("voice.wav", 0.5))
+                self.assertEqual(popen.call_args.args[0], expected)
+
+    def test_paplay_volume_represents_linear_gain_including_amplification_and_silence(self):
+        for gain, expected in ((-1, 0), (0, 0), (0.125, 32768), (0.5, 52016), (1, 65536), (8, 131072)):
+            with self.subTest(gain=gain), mock.patch.object(bridge.sys, "platform", "linux"), \
+                 mock.patch.object(bridge.shutil, "which", side_effect=lambda p: p if p == "paplay" else None), \
+                 mock.patch.object(bridge.subprocess, "Popen") as popen:
+                self.assertTrue(bridge.Sounds()._play_file("voice.wav", gain))
+                cmd = popen.call_args.args[0]
+                self.assertEqual(cmd, ["paplay", "--volume", str(expected), "voice.wav"])
+                self.assertAlmostEqual((int(cmd[2]) / 65536) ** 3, max(0, gain), delta=0.00003)
+
+    def test_mac_keeps_afplay_even_when_linux_players_exist(self):
+        with mock.patch.object(bridge.sys, "platform", "darwin"), \
+             mock.patch.object(bridge.shutil, "which") as which, \
+             mock.patch.object(bridge.subprocess, "Popen") as popen:
+            self.assertTrue(bridge.Sounds()._play_file("voice.wav", 1.7))
+        which.assert_not_called()
+        self.assertEqual(popen.call_args.args[0], ["afplay", "-v", "1.7", "voice.wav"])
+
+    def test_missing_player_is_reported_once_and_gags_stay_inactive(self):
+        with mock.patch.object(bridge.sys, "platform", "linux"), \
+             mock.patch.object(bridge.shutil, "which", return_value=None), \
+             mock.patch.object(bridge.log, "info") as log, \
+             mock.patch.object(bridge.threading, "Timer") as timer, \
+             mock.patch.object(bridge.subprocess, "Popen") as popen:
+            sounds = bridge.Sounds()
+            for _ in range(3):
+                self.assertFalse(sounds.play_gag("tap_shock_idle", force=True))
+                self.assertFalse(sounds._play_file("voice.wav", 1))
+        self.assertEqual(log.call_count, 1)
+        timer.assert_not_called()
+        popen.assert_not_called()
+
+
+class PlatformSkips(unittest.TestCase):
+    def test_linux_focus_does_no_polling_or_library_access(self):
+        with mock.patch.object(bridge.sys, "platform", "linux"), \
+             mock.patch.object(bridge.threading, "Thread") as thread, \
+             mock.patch.object(bridge.glob, "glob", side_effect=AssertionError("filesystem poll")), \
+             mock.patch.object(bridge.subprocess, "run", side_effect=AssertionError("Mac command")), \
+             mock.patch.object(bridge.log, "info") as log:
+            focus = bridge.Focus()
+            focus._run()
+            focus._poll_log()
+            self.assertEqual(focus._cli_id("local_fake"), (None, None))
+            self.assertIsNone(bridge.account_of_pid(123))
+            self.assertFalse(bridge.SlackWatch.slack_in_front())
+        thread.assert_not_called()
+        log.assert_not_called()
+        self.assertFalse(focus.front)
+        self.assertIsNone(focus.code_session)
+
+    def test_mac_still_starts_focus_polling(self):
+        with mock.patch.object(bridge.sys, "platform", "darwin"), \
+             mock.patch.object(bridge.threading, "Thread") as thread:
+            bridge.Focus()
+        thread.return_value.start.assert_called_once_with()
+
+    def test_linux_startup_skips_app_watcher(self):
+        with mock.patch.object(bridge.sys, "platform", "linux"), \
+             mock.patch.object(bridge, "Buddy") as buddy, \
+             mock.patch.object(bridge, "AppPages") as app, \
+             mock.patch.object(bridge, "Calendar"), mock.patch.object(bridge, "SlackWatch"), \
+             mock.patch.object(bridge.http.server, "ThreadingHTTPServer") as server, \
+             mock.patch.object(bridge, "buddy", None):
+            bridge.main()
+            self.assertIsNone(buddy.return_value.app)
+        app.assert_not_called()
+        server.return_value.serve_forever.assert_called_once_with()
+
+    def test_linux_ignores_app_reports_without_log_errors(self):
+        import io
+        handler = bridge.Handler.__new__(bridge.Handler)
+        handler.path, handler.headers, handler.rfile = "/app", {"Content-Length": "2"}, io.BytesIO(b"{}")
+        with mock.patch.object(bridge, "buddy", mock.Mock(app=None)), \
+             mock.patch.object(handler, "_reply") as reply, mock.patch.object(bridge.log, "info") as log:
+            handler.do_POST()
+        reply.assert_called_once_with(204)
+        log.assert_not_called()
 
 
 class FakeSlack:
@@ -687,6 +1029,8 @@ class TwoAccounts(BridgeTest):
 class FocusAcrossAccounts(unittest.TestCase):
     """Which Code session is on screen, with both copies writing to the same log."""
     def setUp(self):
+        platform = mock.patch.object(bridge.sys, "platform", "darwin")
+        platform.start(); self.addCleanup(platform.stop)
         self.support = tempfile.mkdtemp(prefix="deskbuddy-support-")
         for folder, local, cli in (("Claude", "local_aaa", "cli-personal"), ("Claude-Work", "local_bbb", "cli-work")):
             d = os.path.join(self.support, folder, "claude-code-sessions", "acct", "org")
