@@ -10,7 +10,9 @@ local files, and POSTs the ones that differ; the board checks each upload's hash
 bar, and restarts. Uses the pairing token and host from ~/.desk-buddy/config.json (written by
 tools/wifi_setup.py). A cable is only needed for a new partition layout or recovery: tools/flash.sh.
 """
+from contextlib import nullcontext
 import argparse, hashlib, json, os, socket, subprocess, sys, time, urllib.error, urllib.request
+from bridge_host import paused_bridge
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, "firmware", ".pio", "build", "buddy", "firmware.bin")
@@ -66,14 +68,17 @@ def send(ip, token, kind, path, extra):
     print(f"  done in {time.time() - t:.0f} s ({mb * 8 / max(time.time() - t, 0.1):.1f} Mbit/s); he's restarting", flush=True)
 
 
-def main():
+def update():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--app", action="store_true", help="only the program")
     ap.add_argument("--art", action="store_true", help="only the drawings")
     ap.add_argument("--force", action="store_true", help="send even if the board already has it")
     ap.add_argument("--no-build", action="store_true", help="don't run pio before sending the program")
     ap.add_argument("--host", help="board address (default: lump_host from config.json, else lump.local)")
+    ap.add_argument("--env", choices=("buddy", "esp32-32e"), default="buddy", help="PlatformIO board environment")
     a = ap.parse_args()
+    if a.env == "esp32-32e":
+        sys.exit("ESP32-32E uses a single program slot and USB updates: tools/flash.sh esp32-32e")
     want_app, want_art = (a.app or not a.art), (a.art or not a.app)
 
     cfg = json.load(open(CONFIG)) if os.path.exists(CONFIG) else {}
@@ -84,7 +89,7 @@ def main():
 
     if want_app and not a.no_build:
         print("building...", flush=True)
-        r = subprocess.run(["pio", "run"], cwd=os.path.join(ROOT, "firmware"), capture_output=True, text=True)
+        r = subprocess.run(["pio", "run", "-e", a.env], cwd=os.path.join(ROOT, "firmware"), capture_output=True, text=True)
         if r.returncode:
             sys.exit(r.stdout[-3000:] + r.stderr[-2000:] + "\nbuild failed")
     for kind, path, want in (("app", APP, want_app), ("art", ART, want_art)):
@@ -113,12 +118,23 @@ def main():
         else:
             print("program: already up to date")
 
-    for i, (kind, path, extra) in enumerate(todo):
-        send(ip, token, kind, path, extra)
-        back = wait_back(ip, token)
-        print(f"  back: running {back.get('running')}, drawings {'ok' if back.get('art_ok') else 'MISSING/BAD'}")
     if todo:
+        # macOS OTA historically leaves launchd alone; only Linux needs the new service guard.
+        guard = paused_bridge() if sys.platform.startswith("linux") else nullcontext()
+        with guard:
+            for kind, path, extra in todo:
+                send(ip, token, kind, path, extra)
+                back = wait_back(ip, token)
+                print(f"  back: running {back.get('running')}, drawings {'ok' if back.get('art_ok') else 'MISSING/BAD'}")
         print("Lump is up to date.")
+
+
+def main():
+    try:
+        update()
+    except (OSError, urllib.error.URLError) as e:
+        sys.exit(f"OTA connection failed: {e}. Check the board address and Wi-Fi. "
+                 "ESP32-32E has USB updates only: tools/flash.sh esp32-32e")
 
 
 if __name__ == "__main__":

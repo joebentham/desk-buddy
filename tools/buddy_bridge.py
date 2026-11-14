@@ -16,8 +16,9 @@ It also sends one-off events: "oops" when a tool call fails, and "hello" the fir
 time you start a session after a long break. The board itself handles escalation
 (alert -> waiting after 45 s, working -> longhaul after 10 min) and idle fidgets.
 
-Chat and Cowork have no hooks, so a small helper (tools/appwatch, its own login
+On macOS, Chat and Cowork have no hooks, so a small helper (tools/appwatch, its own login
 item) reads the Claude app's accessibility tree and posts page states to /app.
+Linux uses Claude Code hooks and the status line; desktop focus tracking stays off.
 
 Two Claude accounts (personal and work) can run side by side: Claude Switcher starts each as its own
 copy of the app, the work one with its own data folder (Claude-Work) and Claude Code settings
@@ -29,7 +30,7 @@ of your VIPs makes him hold up a letter until Slack says you've read it (or half
 any other DM, or a message that @-mentions you, sends a paper plane looping round him, once.
 Channel traffic that doesn't tag you is never looked at, and "needs you" from Claude always wins.
 
-He also has a little ocarina voice that plays on the Mac's speakers (class Sounds): the WAVs
+He also has a little ocarina voice that plays on the host's speakers (class Sounds): the WAVs
 come from tools/make_sounds.py and which moments make a sound lives in ~/.desk-buddy/sounds.json
 ("enabled" is the master switch; Claude Switcher's right-click menu flips it).
 
@@ -42,8 +43,9 @@ Extras for debugging:  GET /status   POST /cmd  (body: a raw command such as "s 
                        (play tap_<gag>_<mood> plays a gag's sound, e.g. play tap_shock_idle)
 Install as a login item with tools/install_bridge.sh.
 """
-import glob, http.server, json, logging, logging.handlers, os, random, re, subprocess, sys, threading, time, wave
+import glob, http.server, json, logging, logging.handlers, os, random, re, shutil, subprocess, sys, threading, time, wave
 import serial
+from bridge_host import probe_lump, usb_identity, usb_ports
 
 HTTP_PORT = 47823
 HOME = os.environ.get("DESKBUDDY_HOME") or os.path.expanduser("~/.desk-buddy")   # tests point this elsewhere
@@ -103,6 +105,7 @@ FIDGET_EVERY = (5 * 60, 15 * 60)
 # that (his way in from the mood is padded to 12 frames at 24 fps); the night startle has no way in.
 GAG_LEAD = 0.5
 AFPLAY_LAG = 0.05                       # afplay takes a moment to start making sound
+LINUX_AUDIO_LAG = 0.05                  # initial estimate; sounds.json "player_lag" tunes this (seconds)
 # Heartbeat: "h <seconds since local midnight>" every HEARTBEAT_EVERY. If the board hears nothing
 # for a minute (bridge crashed, Mac asleep, USB power only) he goes his own way: idle and fidgeting,
 # asleep at night, with a little unplugged-cable mark. The heartbeat also tells him the time.
@@ -122,7 +125,8 @@ log.setLevel(logging.INFO)
 _h = logging.handlers.RotatingFileHandler(os.path.join(HOME, "bridge.log"), maxBytes=500_000, backupCount=2)
 _h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 log.addHandler(_h)
-if sys.stderr.isatty():          # under launchd stderr is bridge.out, which only needs crashes
+if sys.stderr.isatty() or (sys.platform.startswith("linux") and "JOURNAL_STREAM" in os.environ):
+    # Interactive terminals and the Linux journal; launchd's bridge.out only needs crashes.
     log.addHandler(logging.StreamHandler())
 
 
@@ -145,6 +149,7 @@ class Device:
     def __init__(self, on_ready, on_line=None):
         self.ser, self.lock, self.on_ready, self.on_line = None, threading.Lock(), on_ready, on_line
         self.link, self._last_err = None, {}
+        self._usb_identity = None
         threading.Thread(target=self._run, daemon=True).start()
 
     @property
@@ -153,14 +158,23 @@ class Device:
 
     @staticmethod
     def usb_ports():
-        return sorted(glob.glob("/dev/cu.usbmodem*"))
+        return usb_ports()
 
     def _targets(self):
         if os.environ.get("DESKBUDDY_PORT"):
             return [os.environ["DESKBUDDY_PORT"]]
         cfg = read_config()
         net = [f"socket://{cfg.get('lump_host') or 'lump.local'}:{NET_PORT}"] if cfg.get("lump_token") else []
-        return self.usb_ports() + net
+        ports = self.usb_ports()
+        identity = getattr(self, "_usb_identity", None)
+        if identity:
+            if identity[0] == "serial_number":
+                ports = [p for p in ports if usb_identity(p) == identity]
+            else:
+                # A socket or tty path can change when a serial-less board moves.
+                # Prefer the old identity, then probe the remaining candidates.
+                ports = sorted(ports, key=lambda p: usb_identity(p) != identity)
+        return ports + net
 
     def _fail(self, p, e):
         msg = str(e)
@@ -168,8 +182,11 @@ class Device:
             self._last_err[p] = msg
             log.info("can't open %s: %s", p, msg)
 
-    def _open(self):
+    def _open(self, usb_only=False):
         for p in self._targets():
+            if usb_only and p.startswith("socket://"):
+                continue
+            s = None
             try:
                 if p.startswith("socket://"):
                     import socket as so
@@ -189,13 +206,19 @@ class Device:
                     self.link = "wifi"
                 else:
                     s = serial.Serial(); s.port, s.baudrate, s.timeout = p, 115200, 0.3
-                    s.dtr = False; s.rts = False      # don't reset the board when opening
+                    s.dtr = False; s.rts = False      # request no reset; CH340 may still reset on open
                     s.open()
+                    if not probe_lump(s):
+                        raise OSError("no Lump state reply within 3 seconds")
+                    self._usb_identity = usb_identity(p)
                     self.link = "usb"
                 self._last_err.pop(p, None)
                 log.info("connected to %s", p)
                 return s
             except Exception as e:
+                if s is not None:
+                    try: s.close()
+                    except Exception: pass
                 self._fail(p, e)
         return None
 
@@ -218,7 +241,15 @@ class Device:
             if self.link == "wifi" and time.time() - usb_checked > self.USB_CHECK:
                 usb_checked = time.time()
                 if self.usb_ports() and not os.environ.get("DESKBUDDY_PORT"):
-                    self._drop("USB cable found: switching from Wi-Fi"); continue
+                    # Keep the working network link until USB is verified. An unrelated
+                    # adapter must not interrupt Wi-Fi every USB_CHECK seconds.
+                    s = self._open(usb_only=True)
+                    if s is not None:
+                        self._drop("verified USB cable found: switching from Wi-Fi")
+                        with self.lock:
+                            self.ser, self.link = s, "usb"
+                        buf = b""
+                        self._call(self.on_ready)
             try:
                 buf += self.ser.read(256)
                 while b"\n" in buf:
@@ -338,6 +369,8 @@ def account_of_data_dir(path):
 
 def account_of_pid(pid):
     """Which account a running copy of the Claude app belongs to (from its --user-data-dir)."""
+    if sys.platform != "darwin":
+        return None
     try:
         cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=2).stdout
     except Exception:
@@ -367,7 +400,7 @@ class Focus:
         self.account, self.last_account = None, PERSONAL   # the Claude copy in front (None: none is), and the last one that was
         self.focused = {}                                 # account -> cli session id showing in that copy's Code tab
         self._pids = {}
-        if start:
+        if start and sys.platform == "darwin":
             threading.Thread(target=self._run, daemon=True).start()
 
     @property
@@ -377,6 +410,8 @@ class Focus:
 
     def _cli_id(self, local):
         """(account, cliSessionId) for a desktop Code session; misses aren't cached (the file may come later)."""
+        if sys.platform != "darwin":
+            return None, None
         if local not in self._map:
             files = glob.glob(os.path.join(glob.escape(self.SUPPORT), "Claude*", "claude-code-sessions", "*", "*", local + ".json"))
             if not files:
@@ -415,6 +450,8 @@ class Focus:
         return self._pids[pid] or PERSONAL
 
     def _poll_log(self):
+        if sys.platform != "darwin":
+            return
         logs = sorted(glob.glob(os.path.join(self.LOGS, "main*.log")), key=os.path.getmtime)
         if not logs: return
         if logs[-1] != self._log:                    # first run or the app rotated its log
@@ -434,6 +471,8 @@ class Focus:
             if hits: self._apply(hits[-1])
 
     def _run(self):
+        if sys.platform != "darwin":
+            return
         import subprocess
         while True:
             try:
@@ -447,7 +486,8 @@ class Focus:
 
 
 class Sounds:
-    """Plays Lump's voice through afplay. Settings are re-read whenever sounds.json changes, so
+    """Plays Lump's voice through afplay (Mac) or pw-play/paplay/aplay (Linux).
+    Settings are re-read whenever sounds.json changes, so
     flipping "enabled" (Claude Switcher, POST /sound, or by hand) takes effect immediately.
       {"enabled": true, "volume": 1.0, "quiet_at_night": true,
        "moments": {"needs_you": {"on": true, "pick": ["a", "c"]}, ...}}
@@ -457,6 +497,32 @@ class Sounds:
         self.lock, self.cfg, self.mtime = threading.Lock(), {}, None
         self.last_any, self.last_at, self.last_pick, self.proc = 0.0, {}, {}, None
         self.gag_until, self.gag_timer = 0.0, None             # a gag's sound is playing (or about to) until then
+        self.player = ("afplay" if sys.platform == "darwin" else
+                       next((p for p in ("pw-play", "paplay", "aplay") if shutil.which(p)), None))
+        if self.player is None:
+            log.info("sounds unavailable: install pw-play, paplay or aplay")
+
+    def _play_file(self, path, volume):
+        if self.player is None:
+            return False
+        if self.player == "afplay":
+            cmd = ["afplay", "-v", str(volume), path]
+        elif self.player == "pw-play":
+            cmd = ["pw-play", "--volume", str(volume), path]
+        elif self.player == "paplay":
+            # PulseAudio's units are cubic: (units / 65536)^3 is the linear gain.
+            units = round(65536 * max(0.0, float(volume)) ** (1 / 3))
+            cmd = ["paplay", "--volume", str(units), path]
+        else:                                               # ALSA has no per-stream volume option
+            cmd = ["aplay", "-q", path]
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()                           # one voice at a time
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            log.info("%s failed: %s", self.player, e)
+            return False
+        return True
 
     def settings(self):
         try:
@@ -506,13 +572,8 @@ class Sounds:
             if not os.path.exists(path):
                 log.info("sound %s missing (run tools/make_sounds.py)", path)
                 return False
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()                         # one voice at a time
-            try:
-                self.proc = subprocess.Popen(["afplay", "-v", str(cfg.get("volume", 1.0)), path],
-                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception as e:
-                log.info("afplay failed: %s", e); return False
+            if not self._play_file(path, cfg.get("volume", 1.0)):
+                return False
             self.last_any = self.last_at[moment] = now
             self.last_pick[moment] = k
             log.info("sound %s %s", moment, k)
@@ -530,6 +591,8 @@ class Sounds:
             cfg = self.settings()
             if not force and (not cfg.get("enabled") or not (cfg.get("moments") or {}).get("tap_gags", {"on": True}).get("on", True)):
                 return False
+            if self.player is None:
+                return False
             if not os.path.exists(path):
                 log.info("sound %s missing (run tools/make_gag_sounds.py)", path); return False
             try:
@@ -537,7 +600,8 @@ class Sounds:
                     length = w.getnframes() / w.getframerate()
             except Exception:
                 length = 5.0
-            delay = max(0.0, (0 if gag == "startle" else GAG_LEAD) - AFPLAY_LAG)
+            lag = AFPLAY_LAG if self.player == "afplay" else max(0.0, float(cfg.get("player_lag", LINUX_AUDIO_LAG)))
+            delay = max(0.0, (0 if gag == "startle" else GAG_LEAD) - lag)
             if self.gag_timer:
                 self.gag_timer.cancel()
             self.gag_until = time.time() + delay + length
@@ -549,12 +613,8 @@ class Sounds:
     def _start_gag(self, path, gag):
         with self.lock:
             volume = self.settings().get("volume", 1.0)          # read now, so a just-moved slider counts
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()                         # one voice at a time
-            try:
-                self.proc = subprocess.Popen(["afplay", "-v", str(volume), path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception as e:
-                log.info("afplay failed: %s", e); return
+            if not self._play_file(path, volume):
+                return
             self.last_any = time.time()
             log.info("sound gag %s (volume %s)", gag, volume)
 
@@ -1317,6 +1377,8 @@ class SlackWatch:
     def slack_in_front():
         """Is Slack the app you're using right now? (Then a plane is just noise, and a VIP message you're
         reading as it lands shouldn't get the whole letter routine.)"""
+        if sys.platform != "darwin":
+            return False
         try:
             asn = subprocess.run(["lsappinfo", "front"], capture_output=True, text=True, timeout=2).stdout.strip()
             out = subprocess.run(["lsappinfo", "info", "-only", "bundleID", asn], capture_output=True, text=True, timeout=2).stdout
@@ -1452,7 +1514,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as e: log.info("bad hook payload: %s", e)
         elif self.path == "/app":
             self._reply(204)
-            try: buddy.app.snapshot(json.loads(body or b"{}"))
+            try:
+                if buddy.app is not None:
+                    buddy.app.snapshot(json.loads(body or b"{}"))
             except Exception as e: log.info("bad app snapshot: %s", e)
         elif self.path == "/usage":               # from tools/statusline.sh (status line JSON)
             self._reply(204)
@@ -1492,10 +1556,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._reply(404)
 
 
-if __name__ == "__main__":
+def main():
+    global buddy
     buddy = Buddy()
-    buddy.app = AppPages(buddy)
+    buddy.app = AppPages(buddy) if sys.platform == "darwin" else None
     buddy.calendar = Calendar()
     buddy.slack = SlackWatch(buddy)
     log.info("desk-buddy bridge listening on 127.0.0.1:%d", HTTP_PORT)
     http.server.ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
