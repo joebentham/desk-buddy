@@ -37,14 +37,26 @@ It sends a heartbeat ("h", which also carries the time of day) every 15 s; witho
 goes its own way after a minute and shows he's not connected. Session state is kept in
 ~/.desk-buddy/state.json across restarts.
 
-Extras for debugging:  GET /status   POST /cmd  (body: a raw command such as "s done")
+Extras for debugging:  GET /status   POST /cmd  (body: a raw command such as "s done")   POST /resync
                        GET /sound    POST /sound (body: on | off | toggle | play <moment>)
                        (play tap_<gag>_<mood> plays a gag's sound, e.g. play tap_shock_idle)
-Install as a login item with tools/install_bridge.sh.
+Install as a login item with tools/install_bridge.sh (macOS) or tools/windows/install.ps1 (Windows).
+
+Windows: the same bridge, with Windows stand-ins for the Mac-only parts (all behind IS_WIN, imported only
+there): the board is found by its USB-serial chip's ID, the Claude app in front comes from the foreground
+window, sounds play through winsound, and usage also comes from the desktop app's own usage history
+(class AppUsageFile), since the desktop app has no status line.
+
+Remote link: Lump can be plugged into a different computer from the one Claude runs on. A small relay there
+(tools/lump_relay.py) dials in to this bridge over Tailscale and passes lines to and from the board. The bridge
+only ever listens for it on 127.0.0.1:4211 (`tailscale serve` forwards the tailnet to that), only once
+"relay_token" is in config.json, and treats everything the relay says as untrusted (class RelayListener).
 """
-import glob, http.server, json, logging, logging.handlers, os, random, re, subprocess, sys, threading, time, wave
+import collections, glob, hmac, http.server, json, logging, logging.handlers, os, queue, random, re, select, socket
+import subprocess, sys, threading, time, wave
 import serial
 
+IS_WIN = sys.platform == "win32"         # Windows stand-ins for the Mac-only parts (see the docstring)
 HTTP_PORT = 47823
 HOME = os.environ.get("DESKBUDDY_HOME") or os.path.expanduser("~/.desk-buddy")   # tests point this elsewhere
 NIGHT_START, NIGHT_END = 0, 8           # local hours: night (deep sleep under the blanket) is midnight to 8am
@@ -74,6 +86,23 @@ TAP_SNOOZE = 120                        # tapping "needs you" holds off the nagg
 GAGS = ("shock", "moto", "wolf", "accordion", "anvil", "disco", "glass", "banana", "balloon", "sneeze", "moon", "bomb")
 ANIMATIONS = {"tap": "tap", **{g: f"tap_{g}" for g in GAGS}, "startle": "tap_startle_night", "prep": "tap_prep",
               **{e: e for e in ("fidget_toss", "fidget_twitch", "fidget_bubble", "oops", "hello")}}
+# The board's moods, and the gag names it can print in "gag tap_<gag>_<mood>". Only those are ever turned into a
+# sound file name, whichever link the line came over (a made-up one could otherwise point outside sounds/).
+BOARD_MOODS = ("idle", "awake", "working", "alert", "waiting", "done", "longhaul", "night", "letter", "meeting")
+GAG_EVENT_RE = re.compile(r"tap_(%s)_(%s)" % ("|".join(GAGS + ("startle", "prep", "plane")), "|".join(BOARD_MOODS)))
+
+
+# the one-off animations the board can announce ("event <name>"): its fidgets, oops, hello and the tap gags
+EVENT_ANIM_RE = re.compile(r"fidget_(toss|twitch|bubble)|oops|hello|" + GAG_EVENT_RE.pattern)
+
+
+def event_anim_ok(name):
+    return isinstance(name, str) and EVENT_ANIM_RE.fullmatch(name) is not None
+
+
+def gag_event_ok(event):
+    """Is this a gag the board can really print (tap_<gag>_<mood>, both from the known sets)?"""
+    return isinstance(event, str) and GAG_EVENT_RE.fullmatch(event) is not None
 # Usage gauge: his colour warms from Tangerine to red as the busier of your 5-hour / weekly
 # Claude limits fills up (fed by the Claude Code status line, see tools/statusline.sh).
 USAGE_STOPS = [(0.0, "FF7A45"), (0.5, "FF7A45"), (0.8, "FF4B2B"), (0.97, "C8102E"), (1.0, "8F7C78")]
@@ -103,12 +132,26 @@ FIDGET_EVERY = (5 * 60, 15 * 60)
 # that (his way in from the mood is padded to 12 frames at 24 fps); the night startle has no way in.
 GAG_LEAD = 0.5
 AFPLAY_LAG = 0.05                       # afplay takes a moment to start making sound
+WINSOUND_LAG = 0.02                     # ...winsound (Windows) less so
 # Heartbeat: "h <seconds since local midnight>" every HEARTBEAT_EVERY. If the board hears nothing
 # for a minute (bridge crashed, Mac asleep, USB power only) he goes his own way: idle and fidgeting,
 # asleep at night, with a little unplugged-cable mark. The heartbeat also tells him the time.
 HEARTBEAT_EVERY = 15
 NET_PORT = 4210                                    # the board's command port on Wi-Fi (tools/wifi_setup.py)
+# Remote link (class RelayListener): a relay on another computer, with Lump plugged into it, dials in here.
+RELAY_PORT = 4211                       # on 127.0.0.1 only; `tailscale serve --tcp 4211` brings the tailnet to it
+RELAY_TOKEN_RE = re.compile(r"[0-9a-fA-F]{32}")    # config.json "relay_token": 128 bits as hex, or no listener
+RELAY_LINE_MAX = 256                    # longest line taken from a relay (longer ones are thrown away whole)
+RELAY_SILENCE = 30                      # a relay says "relay board 0|1" every 10 s: this long without a line, drop it
+RELAY_SEND_TIMEOUT = 2                  # a write the relay doesn't take within this long drops it
+RELAY_RATE, RELAY_BURST = 20, 20        # lines per second from a relay (a bucket this deep)...
+RELAY_FLOOD, RELAY_FLOOD_SECS = 100, 10  # ...and this many over the limit within this long drops it
+RELAY_EVENT_GAP = 2                     # tap, gag, resync and boot from a relay: each at most once this often
 STATE_FILE = os.path.join(HOME, "state.json")     # sessions etc. survive a bridge restart
+# Stall watchdog (class StallWatch): if the tick loop doesn't come round for this long, every thread's stack goes
+# to stalls.log, so a frozen bridge says where it was stuck.
+STALL_SECS = 15
+STALLS_FILE = os.path.join(HOME, "stalls.log")
 # Slack, polled with your user token (see class SlackWatch). config.json: "slack_token" (xoxp-..., never
 # logged), "slack_vips" (names as Slack shows them), optional "slack_vip_minutes" (how long a letter lasts).
 SLACK_EVERY = 20                        # seconds between polls
@@ -119,48 +162,71 @@ PLANE_FRESH = 10 * 60                   # older messages (the bridge was down, t
 os.makedirs(HOME, exist_ok=True)
 log = logging.getLogger("bridge")
 log.setLevel(logging.INFO)
-_h = logging.handlers.RotatingFileHandler(os.path.join(HOME, "bridge.log"), maxBytes=500_000, backupCount=2)
+_h = logging.handlers.RotatingFileHandler(os.path.join(HOME, "bridge.log"), maxBytes=500_000, backupCount=2, encoding="utf-8")
 _h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 log.addHandler(_h)
-if sys.stderr.isatty():          # under launchd stderr is bridge.out, which only needs crashes
+if sys.stderr and sys.stderr.isatty():   # under launchd stderr is bridge.out (only crashes); under pythonw there's none
     log.addHandler(logging.StreamHandler())
 
 
 def read_config():
     try:
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
 
 class Device:
-    """Owns the link to the board: USB serial when it's plugged in, otherwise Wi-Fi (TCP to
-    lump.local:4210, set up with tools/wifi_setup.py, which stores "lump_token" in config.json).
-    Reconnects when the board is unplugged, reboots or drops off the network, and moves back to
-    USB as soon as a cable appears."""
+    """Owns the link to the board: USB serial when it's plugged in; otherwise a remote Lump, plugged into
+    another computer whose relay has dialled in (class RelayListener), while that relay says its board is
+    there; otherwise Wi-Fi (TCP to lump.local:4210, set up with tools/wifi_setup.py, which stores
+    "lump_token" in config.json). Reconnects when the board is unplugged, reboots or drops off the network,
+    moves back to USB as soon as a cable appears (and the port really opens), and from Wi-Fi to the remote
+    Lump as soon as the relay has him (he can't be at home on Wi-Fi and plugged in elsewhere at once)."""
 
-    USB_CHECK = 5                      # while on Wi-Fi, look for a USB cable this often (seconds)
+    USB_CHECK = 5                      # while on Wi-Fi or the remote link, look for a USB cable this often (seconds)
+    RELAY_CHECK = 3                    # re-read "relay_token" this often: the listener runs only while there is one
+    RELAY_PORT = RELAY_PORT
+    SETTLE = 0.3                       # give a freshly opened link a moment before resending everything
+    IDLE_WAIT = 3                      # nothing to connect to: look again after this long (or when the relay pairs)
 
-    def __init__(self, on_ready, on_line=None):
+    def __init__(self, on_ready, on_line=None, start=True):
         self.ser, self.lock, self.on_ready, self.on_line = None, threading.Lock(), on_ready, on_line
         self.link, self._last_err = None, {}
-        threading.Thread(target=self._run, daemon=True).start()
+        self.relay, self._relay_note = None, None       # the RelayListener, while relay_token is set
+        self._wake = threading.Event()
+        self._buf, self._usb_checked, self._relay_checked = b"", 0.0, None
+        if start:
+            threading.Thread(target=self._run, daemon=True).start()
 
     @property
     def connected(self):
         return self.ser is not None
 
+    USB_ID = (0x1A86, 0x55D3)          # the board's WCH CH343 USB-serial chip (how Windows finds it)
+
     @staticmethod
     def usb_ports():
+        if IS_WIN:
+            from serial.tools import list_ports
+            return sorted(p.device for p in list_ports.comports() if (p.vid, p.pid) == Device.USB_ID)
         return sorted(glob.glob("/dev/cu.usbmodem*"))
+
+    RELAY_TARGET = "relay"
+
+    def _relay_link(self):
+        """The paired relay, if it says its board is there (only then is it a link worth using)."""
+        rl = getattr(self, "relay", None)
+        return rl.eligible() if rl else None
 
     def _targets(self):
         if os.environ.get("DESKBUDDY_PORT"):
             return [os.environ["DESKBUDDY_PORT"]]
         cfg = read_config()
         net = [f"socket://{cfg.get('lump_host') or 'lump.local'}:{NET_PORT}"] if cfg.get("lump_token") else []
-        return self.usb_ports() + net
+        relay = [self.RELAY_TARGET] if self._relay_link() else []
+        return self.usb_ports() + relay + net
 
     def _fail(self, p, e):
         msg = str(e)
@@ -168,35 +234,69 @@ class Device:
             self._last_err[p] = msg
             log.info("can't open %s: %s", p, msg)
 
+    @staticmethod
+    def _open_usb(p):
+        s = serial.Serial(); s.port, s.baudrate, s.timeout = p, 115200, 0.3
+        s.dtr = False; s.rts = False      # don't reset the board when opening
+        s.open()
+        return s
+
+    @staticmethod
+    def _open_net(p):
+        import socket as so
+        # look up lump.local as IPv4 only: a general lookup waits 5 s for an IPv6
+        # answer the board never gives
+        host, port = p[len("socket://"):].rsplit(":", 1)
+        ip = so.getaddrinfo(host, int(port), so.AF_INET, so.SOCK_STREAM)[0][4][0]
+        s = serial.serial_for_url(f"socket://{ip}:{port}", timeout=0.3)
+        sock = getattr(s, "_socket", None)
+        if sock:                   # notice a board that vanished from the network
+            sock.setsockopt(so.SOL_SOCKET, so.SO_KEEPALIVE, 1)
+            for opt, v in (("TCP_KEEPALIVE", 10), ("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 5), ("TCP_KEEPCNT", 3)):
+                if hasattr(so, opt):
+                    try: sock.setsockopt(so.IPPROTO_TCP, getattr(so, opt), v)
+                    except OSError: pass
+        s.write(f"k {read_config().get('lump_token', '')}\n".encode())
+        return s
+
+    def _open_relay(self):
+        link = self._relay_link()
+        if not link:
+            raise OSError("the relay no longer has the board")
+        return RelayAdapter(link)
+
     def _open(self):
         for p in self._targets():
             try:
-                if p.startswith("socket://"):
-                    import socket as so
-                    # look up lump.local as IPv4 only: a general lookup waits 5 s for an IPv6
-                    # answer the board never gives
-                    host, port = p[len("socket://"):].rsplit(":", 1)
-                    ip = so.getaddrinfo(host, int(port), so.AF_INET, so.SOCK_STREAM)[0][4][0]
-                    s = serial.serial_for_url(f"socket://{ip}:{port}", timeout=0.3)
-                    sock = getattr(s, "_socket", None)
-                    if sock:                   # notice a board that vanished from the network
-                        sock.setsockopt(so.SOL_SOCKET, so.SO_KEEPALIVE, 1)
-                        for opt, v in (("TCP_KEEPALIVE", 10), ("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 5), ("TCP_KEEPCNT", 3)):
-                            if hasattr(so, opt):
-                                try: sock.setsockopt(so.IPPROTO_TCP, getattr(so, opt), v)
-                                except OSError: pass
-                    s.write(f"k {read_config().get('lump_token', '')}\n".encode())
+                if p == self.RELAY_TARGET:
+                    s = self._open_relay()
+                    self.link = "relay"
+                elif p.startswith("socket://"):
+                    s = self._open_net(p)
                     self.link = "wifi"
                 else:
-                    s = serial.Serial(); s.port, s.baudrate, s.timeout = p, 115200, 0.3
-                    s.dtr = False; s.rts = False      # don't reset the board when opening
-                    s.open()
+                    s = self._open_usb(p)
                     self.link = "usb"
                 self._last_err.pop(p, None)
-                log.info("connected to %s", p)
+                log.info("connected to %s", p if p != self.RELAY_TARGET else "the remote Lump (relay)")
                 return s
             except Exception as e:
                 self._fail(p, e)
+        return None
+
+    def _usb_free(self):
+        """While on Wi-Fi or the remote link: a USB board whose port really opens, as (serial, port), or None.
+        Windows lists the board's port even while another program holds it (a relay running on this same PC,
+        say), so a cable only wins once its port opens; until then the current link stays and a failure is
+        logged once."""
+        for p in self.usb_ports():
+            try:
+                s = self._open_usb(p)
+            except Exception as e:
+                self._fail(p, e)
+                continue
+            self._last_err.pop(p, None)
+            return s, p
         return None
 
     def _drop(self, why):
@@ -207,34 +307,94 @@ class Device:
             self.ser, self.link = None, None
 
     def _run(self):
-        buf, usb_checked = b"", 0.0
         while True:
-            if not self.ser:
-                buf = b""
-                self.ser = self._open()
-                if not self.ser:
-                    time.sleep(3); continue
-                time.sleep(0.3); self._call(self.on_ready)
-            if self.link == "wifi" and time.time() - usb_checked > self.USB_CHECK:
-                usb_checked = time.time()
-                if self.usb_ports() and not os.environ.get("DESKBUDDY_PORT"):
-                    self._drop("USB cable found: switching from Wi-Fi"); continue
             try:
-                buf += self.ser.read(256)
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    text = line.decode(errors="replace").strip()
-                    if text:
-                        log.info("board: %s", text)
-                    # board rebooted, or it had given up on us (no heartbeat) and gone its own way
-                    if "lump ready" in text or text == "resync":
-                        self._call(self.on_ready)
-                    elif (text == "tap" or text.startswith("gag ")) and self.on_line:
-                        self._call(self.on_line, text)
-                    elif text == "err pairing":
-                        log.info("the board refused our pairing token: run tools/wifi_setup.py again")
-            except Exception as e:
-                self._drop(f"{self.link or 'link'} lost: {e}")
+                self._step()
+            except Exception:
+                log.exception("device loop failed")
+                time.sleep(1)
+
+    def _step(self):
+        """One turn of the reader loop: keep the relay listener in step with config.json, keep a link open
+        (switching to a better one when it appears), and read what the board says."""
+        now = time.time()
+        if self._relay_checked is None or not 0 <= now - self._relay_checked < self.RELAY_CHECK:
+            self._relay_checked = now
+            self._relay_config()
+        if not self.ser:
+            self._buf = b""
+            self.ser = self._open()
+            if not self.ser:
+                self._wake.wait(self.IDLE_WAIT); self._wake.clear(); return
+            time.sleep(self.SETTLE); self._call(self.on_ready)
+        if self.link in ("wifi", "relay") and time.time() - self._usb_checked > self.USB_CHECK:
+            self._usb_checked = time.time()
+            usb = None if os.environ.get("DESKBUDDY_PORT") else self._usb_free()
+            if usb:
+                self._drop("USB cable found: switching from " + ("Wi-Fi" if self.link == "wifi" else "the remote link"))
+                self.ser, self.link, self._buf = usb[0], "usb", b""
+                log.info("connected to %s", usb[1])
+                time.sleep(self.SETTLE); self._call(self.on_ready)
+                return
+        if self.link == "wifi" and self._relay_link():
+            self._drop("the remote Lump's relay has him: switching from Wi-Fi"); return
+        try:
+            self._buf += self.ser.read(256)
+            while b"\n" in self._buf:
+                line, self._buf = self._buf.split(b"\n", 1)
+                text = line.decode(errors="replace").strip()
+                if text:
+                    log.info("board: %s", text)
+                # board rebooted, or it had given up on us (no heartbeat) and gone its own way
+                if "lump ready" in text or text == "resync":
+                    self._call(self.on_ready)
+                elif (text == "tap" or text.startswith(("gag ", "event "))) and self.on_line:
+                    self._call(self.on_line, text)
+                elif text == "err pairing":
+                    log.info("the board refused our pairing token: run tools/wifi_setup.py again")
+        except Exception as e:
+            self._drop(f"{self.link or 'link'} lost: {e}")
+
+    # ---- the remote link ----
+    def _relay_config(self):
+        """Start, restart or stop the relay listener to match config.json's "relay_token" (no token: none)."""
+        tok = str(read_config().get("relay_token") or "").strip()
+        if not tok or not RELAY_TOKEN_RE.fullmatch(tok):
+            if self.relay:
+                self._relay_stop("relay_token removed from config.json: remote link off" if not tok else
+                                 "relay_token in config.json isn't 32 hex characters: remote link off")
+            elif tok and self._relay_note != "malformed":
+                log.info("relay_token in config.json isn't 32 hex characters: remote link off")
+            self._relay_note = "malformed" if tok else None
+            return
+        if self.relay:
+            if self.relay.has_token(tok):
+                return
+            self._relay_stop("relay_token changed: the remote Lump's relay needs the new one")
+        try:
+            self.relay = RelayListener(tok, on_board=self._relay_board, on_change=self._wake.set, port=self.RELAY_PORT)
+            self._relay_note = None
+        except OSError as e:
+            if self._relay_note != str(e):          # retried every few seconds: say it once
+                log.info("can't listen for the remote Lump on 127.0.0.1:%d: %s", self.RELAY_PORT, e)
+                self._relay_note = str(e)
+
+    def _relay_stop(self, why):
+        rl, self.relay = self.relay, None
+        rl.stop(why)
+        self._wake.set()
+
+    def _relay_board(self, link, prev, new):
+        """The paired relay's board appeared or vanished. Appearing makes it a link worth switching to (the
+        reader loop does that, and resends); if it's already the link we're on, resend everything now.
+        Vanishing is noticed by the loop, which then falls back to Wi-Fi."""
+        self._wake.set()
+        if new == 1 and prev != 1 and link.active and self.link == "relay":
+            self._call(self.on_ready)
+
+    def relay_status(self):
+        rl = self.relay
+        return rl.status() if rl else None
 
     @staticmethod
     def _call(fn, *a):
@@ -242,7 +402,16 @@ class Device:
         try: fn(*a)
         except Exception: log.exception("serial callback failed")
 
+    @staticmethod
+    def refused(cmd):
+        """Commands the bridge never sends, over any link: "w" (Wi-Fi details: only tools/wifi_setup.py sends
+        those, straight over USB), and anything with CR, LF or NUL in it, which could smuggle in a second line."""
+        return cmd.strip()[:1] == "w" or any(c in cmd for c in "\r\n\0")
+
     def send(self, cmd, quiet=False):
+        if self.refused(cmd):
+            log.info("refused to send a %s to the board", "w command" if cmd.strip()[:1] == "w" else "command with a line break or NUL in it")
+            return False
         with self.lock:
             if not self.ser:
                 return False
@@ -252,6 +421,402 @@ class Device:
                 return True
             except Exception as e:
                 log.info("write failed: %s", e); return False
+
+
+class RelayLink:
+    """One paired relay. Its reader thread owns the socket for the relay's whole life: it reads every line,
+    keeps the line cap and rate limits, and tracks when the relay was last heard from and whether it says its
+    board is there ("relay board 0|1"), whether or not it's the link the Device is using.
+
+    While it is that link (active), the board's lines it accepts go into a small queue that RelayAdapter reads
+    for the Device; otherwise they're thrown away. Only these lines are accepted: tap, resync, the firmware's
+    boot line, and "gag tap_<gag>_<mood>" with a known gag and mood; tap/gag/resync/boot at most once every
+    RELAY_EVENT_GAP each. The relay runs on someone else's computer, so it gets nothing more.
+
+    Unpairing (closing the socket) happens only when the relay goes quiet for RELAY_SILENCE, a write to it
+    times out, it floods the link, a newer relay pairs, or the token changes or goes."""
+
+    QUEUE = 100
+
+    def __init__(self, sock, listener, now):
+        self.sock, self.listener = sock, listener
+        self.board, self.active = None, False      # board: None (not said yet), 0 or 1
+        self.closed, self._close_lock, self.send_lock = threading.Event(), threading.Lock(), threading.Lock()
+        self.q = queue.Queue(self.QUEUE)
+        self.buf, self.skipping = b"", False
+        self.paired_at = self.last_line = now
+        self.tokens, self.tokens_at = float(RELAY_BURST), now
+        self.drops = collections.deque(maxlen=RELAY_FLOOD)
+        self.last_kind, self.quiet_until, self.quieted = {}, 0.0, 0
+
+    # -- reading
+    def run(self):
+        """The reader thread: until unpaired, read, and check the relay hasn't gone quiet."""
+        while not self.closed.is_set():
+            try:
+                ready, _, _ = select.select([self.sock], [], [], 0.25)
+                if ready:
+                    data = self.sock.recv(4096)
+                    if not data:
+                        self.unpair("the remote Lump's relay disconnected"); break
+                    self.feed(data, time.time())
+            except (OSError, ValueError) as e:
+                self.unpair(f"remote link lost: {e}"); break
+            self.check(time.time())
+
+    def feed(self, data, now):
+        """Bytes from the relay. A line longer than RELAY_LINE_MAX is thrown away up to its newline (so the
+        buffer never holds more than that plus one read); the link carries on."""
+        self.buf += data
+        while not self.closed.is_set():
+            nl = self.buf.find(b"\n")
+            if self.skipping:
+                if nl < 0:
+                    self.buf = b""; return
+                self.buf, self.skipping = self.buf[nl + 1:], False
+                continue
+            if nl < 0:
+                if len(self.buf) > RELAY_LINE_MAX:
+                    self.buf, self.skipping = b"", True
+                    self._note(now, "threw away an overlong line from the relay")
+                return
+            line, self.buf = self.buf[:nl], self.buf[nl + 1:]
+            if len(line) > RELAY_LINE_MAX:
+                self._note(now, "threw away an overlong line from the relay")
+                continue
+            self._line(line, now)
+
+    def _line(self, raw, now):
+        self.last_line = now
+        if not self._rate_ok(now):
+            return
+        text = raw.decode("utf-8", "replace").strip()
+        if text in ("relay board 0", "relay board 1"):
+            new, prev = int(text[-1]), self.board
+            self.board = new
+            if new != prev:                        # a repeat is just the relay saying it's still there
+                log.info("remote Lump: board %s on the relay's side", "there" if new else "gone")
+                self.listener._board_changed(self, prev, new)
+            return
+        if not self.active or not text:
+            return                                 # not the link in use: only its status lines matter
+        kind = relay_line_kind(text)
+        if kind is None:
+            self._note(now, "relay: %s" % text[:80]); return
+        if now - self.last_kind.get(kind, -1e18) < RELAY_EVENT_GAP:
+            self._note(now, "relay: %s too soon after the last one, ignored" % kind); return
+        self.last_kind[kind] = now
+        try:
+            self.q.put_nowait(text.encode() + b"\n")
+        except queue.Full:
+            pass
+
+    def _rate_ok(self, now):
+        self.tokens = min(float(RELAY_BURST), self.tokens + max(0.0, now - self.tokens_at) * RELAY_RATE)
+        self.tokens_at = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        self.drops.append(now)
+        if len(self.drops) == self.drops.maxlen and now - self.drops[0] < RELAY_FLOOD_SECS:
+            self.unpair("the remote Lump's relay is flooding the link: dropped it")
+        else:
+            self._note(now, "relay: too many lines, some ignored")
+        return False
+
+    def _note(self, now, what):
+        """Log something the relay did, at most once a second (it mustn't be able to fill the log)."""
+        if now < self.quiet_until:
+            self.quieted += 1; return
+        log.info("%s%s", what, " (and %d more)" % self.quieted if self.quieted else "")
+        self.quiet_until, self.quieted = now + 1, 0
+
+    def check(self, now):
+        if now - self.last_line > RELAY_SILENCE:
+            self.unpair("the remote Lump's relay went quiet for %d s (asleep, or offline): dropped it" % RELAY_SILENCE)
+
+    # -- writing
+    def send(self, data):
+        """Write to the relay; one it doesn't take within RELAY_SEND_TIMEOUT unpairs it (never blocking for longer)."""
+        if self.closed.is_set():
+            raise OSError("the remote Lump's relay isn't connected")
+        with self.send_lock:
+            try:
+                self.sock.sendall(data)
+            except socket.timeout:
+                self.unpair("a write to the remote Lump's relay timed out: dropped it")
+                raise OSError("write to the relay timed out")
+            except OSError as e:
+                self.unpair(f"remote link lost: {e}")
+                raise
+
+    def unpair(self, why):
+        with self._close_lock:
+            if self.closed.is_set():
+                return
+            self.closed.set()
+        self.active = False
+        try: self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
+        try: self.sock.close()
+        except OSError: pass
+        log.info("%s", why)
+        self.listener._unpaired(self)
+
+
+def relay_line_kind(text):
+    """What a line from a relay's board is, if it's one the bridge takes from a relay at all."""
+    if text in ("tap", "resync"):
+        return text
+    if text.startswith("desk-buddy lump ready:"):      # the firmware's boot line: he restarted
+        return "boot"
+    if text.startswith("gag ") and gag_event_ok(text[4:]):
+        return "gag"
+    if text.startswith("event ") and event_anim_ok(text[6:]):   # what he's playing, for a window mirroring him
+        return "event"
+    return None
+
+
+class RelayAdapter:
+    """What the Device holds while the remote Lump is its link: the read/write/flush/close a serial port has.
+    Reads come from the relay's queue (0.3 s timeout, like the serial link); writes go straight to the socket.
+    Closing it only lets go of the link: the relay stays paired (and its socket open) until it's unpaired."""
+
+    READ_TIMEOUT = 0.3
+
+    def __init__(self, link):
+        self.link = link
+        self._drain()
+        link.active = True
+
+    def _drain(self):
+        try:
+            while True: self.link.q.get_nowait()
+        except queue.Empty:
+            pass
+
+    def read(self, n=256):
+        link = self.link
+        if link.closed.is_set():
+            raise OSError("the relay disconnected")
+        if not link.active:
+            raise OSError("let go of the remote link")
+        if link.board != 1:
+            raise OSError("his board was unplugged from the relay's computer (relay board 0)")
+        try:
+            return link.q.get(timeout=self.READ_TIMEOUT)
+        except queue.Empty:
+            return b""
+
+    def write(self, data):
+        self.link.send(data)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.link.active = False
+        self._drain()
+
+
+class RelayListener:
+    """Waits on 127.0.0.1:RELAY_PORT (never another address; `tailscale serve --tcp 4211` brings the tailnet
+    to it) for the relay on the computer Lump is plugged into (tools/lump_relay.py). Runs only while
+    config.json has a well-formed "relay_token" (the Device starts and stops it).
+
+    The relay must send "k <relay_token>" within PAIR_SECS (one line, at most RELAY_LINE_MAX bytes; compared in
+    constant time; never logged). It gets "ok paired", or "err pairing" after a delay that grows with each
+    failure, and is closed. One accept thread; at most MAX_UNPAIRED connections waiting to pair at once (more are
+    closed straight away). Only a paired relay can replace the current one (counted as a takeover)."""
+
+    MAX_UNPAIRED = 4
+    PAIR_SECS = 5
+    FAIL_DELAY, FAIL_DELAY_MAX = 1.0, 8.0
+    FAIL_LOG_EVERY = 10
+
+    def __init__(self, token, on_board=None, on_change=None, port=RELAY_PORT, start=True):
+        self._token = token.encode("ascii")
+        self.on_board, self.on_change = on_board, on_change
+        self.lock = threading.Lock()
+        self.current, self.unpaired, self.pending = None, 0, set()
+        self.takeovers, self.fails, self.stopped = 0, 0, False
+        self._fail_logged, self._fail_quiet = 0.0, 0
+        self.srv, self.port = None, port
+        if start:
+            self.srv = self.bind(port)
+            self.port = self.srv.getsockname()[1]
+            threading.Thread(target=self._accept_loop, daemon=True).start()
+            log.info("waiting for the remote Lump's relay on 127.0.0.1:%d", self.port)
+
+    @staticmethod
+    def bind(port):
+        """127.0.0.1 only. On Windows with SO_EXCLUSIVEADDRUSE, so no other program can bind the same port over
+        us; never SO_REUSEADDR."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if IS_WIN and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            s.bind(("127.0.0.1", port))
+            s.listen(8)
+            s.settimeout(1.0)
+        except Exception:
+            s.close(); raise
+        return s
+
+    def has_token(self, token):
+        return hmac.compare_digest(self._token, str(token).encode("ascii", "replace"))
+
+    def eligible(self):
+        """The paired relay if its board is there, else None."""
+        cur = self.current
+        return cur if cur is not None and cur.board == 1 and not cur.closed.is_set() else None
+
+    def status(self):
+        cur, now = self.current, time.time()
+        return {"listening": self.srv is not None and not self.stopped, "paired": cur is not None,
+                "board": None if cur is None or cur.board is None else cur.board == 1,
+                "active": bool(cur and cur.active), "paired_s": int(now - cur.paired_at) if cur else None,
+                "takeovers": self.takeovers}
+
+    # -- pairing
+    def _accept_loop(self):
+        while not self.stopped:
+            try:
+                conn, _ = self.srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.stopped: return
+                time.sleep(0.5); continue
+            with self.lock:
+                full = self.stopped or self.unpaired >= self.MAX_UNPAIRED
+                if not full:
+                    self.unpaired += 1; self.pending.add(conn)
+            if full:
+                self._close(conn)
+                self._fail_log("remote link: too many connections waiting to pair, closed one")
+                continue
+            threading.Thread(target=self._pair, args=(conn,), daemon=True).start()
+
+    def _read_preauth(self, conn):
+        """The first line, read within PAIR_SECS of connecting and never past RELAY_LINE_MAX bytes, as
+        (line, whatever came after it); (None, b"") if it doesn't come in time, in size, or at all."""
+        deadline, buf = time.time() + self.PAIR_SECS, b""
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                return None, b""
+            ready, _, _ = select.select([conn], [], [], min(left, 0.25))
+            if not ready:
+                continue
+            chunk = conn.recv(RELAY_LINE_MAX - len(buf))
+            if not chunk:
+                return None, b""
+            buf += chunk
+            if b"\n" in buf:
+                line, rest = buf.split(b"\n", 1)
+                return line.strip(), rest
+            if len(buf) >= RELAY_LINE_MAX:
+                return None, b""
+
+    def _pair(self, conn):
+        ok, rest = False, b""
+        try:
+            conn.settimeout(self.PAIR_SECS)
+            line, rest = self._read_preauth(conn)
+            ok = line is not None and hmac.compare_digest(line, b"k " + self._token)
+            if ok:
+                conn.sendall(b"ok paired\n")
+        except (OSError, ValueError):
+            ok = False
+        if not ok:
+            self._refuse(conn)
+        with self.lock:
+            self.unpaired -= 1; self.pending.discard(conn)
+            if self.stopped and ok:
+                ok = False
+        if not ok:
+            self._close(conn); return
+        self.adopt(conn, rest, reader=True)
+
+    def _refuse(self, conn):
+        with self.lock:
+            self.fails += 1
+            delay = min(self.FAIL_DELAY * 2 ** min(self.fails - 1, 10), self.FAIL_DELAY_MAX)
+        self._fail_log("remote link: a connection didn't pair (wrong or no token), closed it")
+        time.sleep(delay)          # slows guessing; holds one of the few unpaired slots meanwhile, never the accept loop
+        try:
+            conn.sendall(b"err pairing\n")
+            # Close gracefully: with unread bytes still waiting (an oversized line), Windows would answer a plain
+            # close with a reset, which can wipe "err pairing" before the other end reads it. So say we're done
+            # sending, then drain a little (bounded) before closing.
+            conn.shutdown(socket.SHUT_WR)
+            conn.settimeout(0.1)
+            end, drained = time.time() + 0.5, 0
+            while time.time() < end and drained < 4096:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                drained += len(chunk)
+        except OSError: pass
+        self._close(conn)
+
+    def _fail_log(self, what):
+        now = time.time()
+        if now - self._fail_logged < self.FAIL_LOG_EVERY:
+            self._fail_quiet += 1; return
+        log.info("%s%s", what, " (and %d more since)" % self._fail_quiet if self._fail_quiet else "")
+        self._fail_logged, self._fail_quiet = now, 0
+
+    @staticmethod
+    def _close(conn):
+        try: conn.close()
+        except OSError: pass
+
+    def adopt(self, conn, rest=b"", reader=True):
+        """A relay that has paired: it becomes the current one (a newer one replaces an older one), and with
+        reader, this thread becomes its reader until it's unpaired."""
+        conn.settimeout(RELAY_SEND_TIMEOUT)
+        link = RelayLink(conn, self, time.time())
+        with self.lock:
+            old, self.current = self.current, link
+            self.fails = 0
+            if old is not None:
+                self.takeovers += 1
+        log.info("the remote Lump's relay paired")
+        if old is not None:
+            old.unpair("a newer relay paired and took over from the old one")
+        if rest:
+            link.feed(rest, time.time())
+        if reader:
+            link.run()
+        return link
+
+    # -- from the links
+    def _board_changed(self, link, prev, new):
+        if link is self.current and self.on_board:
+            self.on_board(link, prev, new)
+
+    def _unpaired(self, link):
+        with self.lock:
+            if self.current is link:
+                self.current = None
+        if self.on_change:
+            self.on_change()
+
+    def stop(self, why):
+        """Stop listening and unpair the current relay (token changed or removed, or the bridge stopping)."""
+        with self.lock:
+            self.stopped = True
+            cur, pending = self.current, list(self.pending)
+        if self.srv:
+            self._close(self.srv)
+        for c in pending:
+            self._close(c)
+        if cur is not None:
+            cur.unpair(why)
+        else:
+            log.info("%s", why)
 
 
 class Calendar:
@@ -279,7 +844,8 @@ class Calendar:
 
     def refresh(self):
         try:
-            cfg = json.load(open(CONFIG_FILE))
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                cfg = json.load(f)
         except Exception:
             return
         url = (cfg.get("calendar_ics") or "").strip()
@@ -309,7 +875,7 @@ class Calendar:
             out.append({"start": st.timestamp(), "end": en.timestamp(), "title": str(e.get("SUMMARY", ""))[:80]})
         out.sort(key=lambda m: m["start"])
         tmp = MEETINGS_FILE + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(out, f)
         os.replace(tmp, MEETINGS_FILE)
         log.info("calendar: %d upcoming meetings", len(out))
@@ -321,18 +887,19 @@ class Calendar:
 # CLAUDE_CONFIG_DIR=~/.claude-<name>. Personal is the plain default everywhere in the bridge; another
 # account's Chat/Cowork sessions are "app:<account>:<name>" and its usage keys "<account>:five_hour".
 PERSONAL = "personal"
-APP_SUPPORT = os.path.expanduser("~/Library/Application Support")
+# Windows: the app's data folders (Claude, Claude-Work ...) live in %APPDATA%, its logs in %LOCALAPPDATA%\Claude\logs
+APP_SUPPORT = os.environ.get("APPDATA", "") if IS_WIN else os.path.expanduser("~/Library/Application Support")
 
 
 def account_of_config(path):
     """The account behind a Claude Code path, e.g. a hook's transcript_path (~/.claude-work/... -> work)."""
-    m = re.search(r"/\.claude-([^/]+)/", path or "")
+    m = re.search(r"[/\\]\.claude-([^/\\]+)[/\\]", path or "")   # either slash, so Windows paths too
     return m.group(1).lower() if m else PERSONAL
 
 
 def account_of_data_dir(path):
     """The account behind a Claude app data folder (.../Application Support/Claude-Work -> work)."""
-    name = os.path.basename((path or "").rstrip("/"))
+    name = os.path.basename((path or "").rstrip("/\\"))
     return name[len("Claude-"):].lower() if name.startswith("Claude-") else PERSONAL
 
 
@@ -344,6 +911,151 @@ def account_of_pid(pid):
         return None
     m = re.search(r"--user-data-dir=(.+?)(?= --|$)", cmd.strip())
     return account_of_data_dir(m.group(1)) if m else PERSONAL
+
+
+def win_foreground():
+    """Windows: (pid, exe path) of the app whose window is in front, or (None, "") when there's none
+    (locked, or a disconnected Remote Desktop session)."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None, ""
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    try:
+        import psutil
+        return pid.value, psutil.Process(pid.value).exe()
+    except Exception:
+        return pid.value or None, ""
+
+
+def is_claude_app(exe):
+    """Is this exe the Claude desktop app (Claude.exe), not the Claude Code CLI (also claude.exe, under claude-code)?"""
+    e = (exe or "").replace("/", "\\").lower()
+    return e.rsplit("\\", 1)[-1] == "claude.exe" and "\\claude-code\\" not in e
+
+
+def data_dir_of_args(args):
+    """The --user-data-dir a copy of the Claude app was started with, or None (the default folder)."""
+    for a in args or []:
+        if a.startswith("--user-data-dir="):
+            return a.split("=", 1)[1].strip('"')
+    return None
+
+
+def account_of_pid_win(pid):
+    """Windows: which account a running copy of the Claude app belongs to (from its --user-data-dir)."""
+    try:
+        import psutil
+        args = psutil.Process(pid).cmdline()
+    except Exception:
+        return None
+    d = data_dir_of_args(args)
+    if not d:
+        return PERSONAL
+    APPS.note_running(d)
+    return APPS.account_for_dir(d)
+
+
+def app_slug(name):
+    """An account key from an app's name ("Work laptop" -> "work-laptop")."""
+    return re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-")[:24] or "app"
+
+
+class ClaudeApps:
+    """The Claude desktop apps on this computer, each its own account (own usage limits, own Code sessions).
+    The usual ones are the data folders Claude Switcher makes (Claude, Claude-Work, ... in APP_SUPPORT). On top:
+    config.json "claude_apps" ([{"name", "path"}], from Lump Control's Settings) for a copy kept somewhere else,
+    and on Windows any running copy started with its own --user-data-dir (found from the process list), so a
+    second app shows up without setting anything. A folder's account: "personal" for the usual Claude folder,
+    "work" for Claude-Work, else its folder's name, so renaming an app only changes its label (its usage
+    readings stay under the same account)."""
+
+    def __init__(self, support=None):
+        self.support, self.running = support, {}          # normalised folder -> folder, of running copies seen
+
+    @staticmethod
+    def _norm(path):
+        return os.path.normcase(os.path.abspath(os.path.expanduser(str(path)))).rstrip("\\/")
+
+    def _support(self):
+        return self.support or APP_SUPPORT
+
+    def usual(self):
+        """The usual data folders: Claude, Claude-Work, ... that hold an app's data ("Local State", or its usage
+        history), so helper folders such as the browser extension's Claude-NativeHost aren't taken for apps."""
+        return sorted(d for d in glob.glob(os.path.join(glob.escape(self._support()), "Claude*"))
+                      if os.path.isfile(os.path.join(d, "Local State")) or os.path.isfile(os.path.join(d, "plan-usage-history.json")))
+
+    def configured(self):
+        out = []
+        for e in read_config().get("claude_apps") or []:
+            if isinstance(e, dict) and str(e.get("path") or "").strip():
+                out.append((str(e.get("name") or "").strip()[:40], str(e["path"]).strip()))
+        return out
+
+    def note_running(self, path):
+        self.running[self._norm(path)] = path
+
+    def detect(self):
+        """Windows: remember the data folders of the copies of the Claude app running now."""
+        if not IS_WIN:
+            return
+        try:
+            import psutil
+        except ImportError:
+            return
+        found = {}
+        for proc in psutil.process_iter(["name", "exe", "cmdline"]):
+            try:
+                if not is_claude_app(proc.info.get("exe") or proc.info.get("name") or ""):
+                    continue
+                d = data_dir_of_args(proc.info.get("cmdline"))
+                if d:
+                    found[self._norm(d)] = d
+            except Exception:
+                continue
+        self.running = found
+
+    def list(self):
+        """[{"account", "name", "path", "source": "usual" | "configured" | "running"}], the usual apps first."""
+        names = {self._norm(p): n for n, p in self.configured()}
+        apps, seen, used = [], set(), set()
+        for d in self.usual():
+            acct = account_of_data_dir(d)
+            apps.append({"account": acct, "name": names.get(self._norm(d)) or ("Main" if acct == PERSONAL else acct.capitalize()),
+                         "path": d, "source": "usual"})
+            seen.add(self._norm(d)); used.add(acct)
+        extra = [(n, p, "configured") for n, p in self.configured()]
+        extra += [("", p, "running") for p in self.running.values()]
+        for name, path, source in extra:
+            key = self._norm(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            folder = os.path.basename(path.rstrip("\\/")) or "Claude"
+            name, acct = name or folder.capitalize(), app_slug(folder)      # renaming changes the label only
+            while acct in used or acct == PERSONAL:
+                acct += "-2"
+            used.add(acct)
+            apps.append({"account": acct, "name": name, "path": path, "source": source})
+        return apps
+
+    def extra_dirs(self):
+        """(account, folder) for apps outside the usual folders."""
+        return [(a["account"], a["path"]) for a in self.list() if a["source"] != "usual"]
+
+    def account_for_dir(self, path):
+        key = self._norm(path)
+        for a in self.list():
+            if self._norm(a["path"]) == key:
+                return a["account"]
+        return account_of_data_dir(path)
+
+
+APPS = ClaudeApps()
 
 
 class Focus:
@@ -358,7 +1070,7 @@ class Focus:
     which copy it came from (its file is in that copy's data folder); "null" (no Code session
     showing) doesn't, so it's put down to the copy in front, or the one that was in front last."""
 
-    LOGS = os.path.expanduser("~/Library/Logs/Claude")
+    LOGS = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Claude", "logs") if IS_WIN else os.path.expanduser("~/Library/Logs/Claude")
     SUPPORT = APP_SUPPORT                 # Claude/ (personal), Claude-Work/ ... each with claude-code-sessions/
     FOCUS_RE = re.compile(r"setFocusedSession: sessionId=(local_[0-9a-f-]+|null)")
 
@@ -379,12 +1091,17 @@ class Focus:
         """(account, cliSessionId) for a desktop Code session; misses aren't cached (the file may come later)."""
         if local not in self._map:
             files = glob.glob(os.path.join(glob.escape(self.SUPPORT), "Claude*", "claude-code-sessions", "*", "*", local + ".json"))
+            acct = None
+            for a, d in APPS.extra_dirs() if not files else ():      # an app kept elsewhere (ClaudeApps)
+                files = glob.glob(os.path.join(glob.escape(d), "claude-code-sessions", "*", "*", local + ".json"))
+                if files:
+                    acct = a; break
             if not files:
                 return None, None
             path = files[0]
-            acct = account_of_data_dir(path[:path.index(os.sep + "claude-code-sessions" + os.sep)])
+            acct = acct or account_of_data_dir(path[:path.index(os.sep + "claude-code-sessions" + os.sep)])
             try:
-                with open(path) as f: self._map[local] = (acct, json.load(f).get("cliSessionId"))
+                with open(path, encoding="utf-8") as f: self._map[local] = (acct, json.load(f).get("cliSessionId"))
             except Exception: return acct, None
         return self._map[local]
 
@@ -433,21 +1150,96 @@ class Focus:
             self._pos = size
             if hits: self._apply(hits[-1])
 
+    def _front_account_win(self, pid, exe):
+        """Windows: the Claude copy in front, from the foreground window's process, or None."""
+        if not pid or not is_claude_app(exe):
+            return None
+        if pid not in self._pids:
+            if len(self._pids) > 50: self._pids.clear()
+            self._pids[pid] = account_of_pid_win(pid)
+        return self._pids[pid] or PERSONAL
+
+    def front_now(self):
+        """The Claude copy in front right now (None: another app is)."""
+        if IS_WIN:
+            return self._front_account_win(*win_foreground())
+        info = subprocess.run(["lsappinfo", "info", "-only", "bundleid", "-only", "pid", subprocess.run(["lsappinfo", "front"], capture_output=True, text=True).stdout.strip()],
+                              capture_output=True, text=True, timeout=2).stdout
+        return self._front_account(info)
+
     def _run(self):
-        import subprocess
         while True:
             try:
-                info = subprocess.run(["lsappinfo", "info", "-only", "bundleid", "-only", "pid", subprocess.run(["lsappinfo", "front"], capture_output=True, text=True).stdout.strip()],
-                                      capture_output=True, text=True, timeout=2).stdout
-                self.set_front(self._front_account(info))
+                self.set_front(self.front_now())
                 self._poll_log()
             except Exception as e:
                 log.info("focus check failed: %s", e)
             time.sleep(1.5)
 
 
+class WinSound:
+    """Windows stand-in for an afplay process: plays a WAV through winsound (asynchronously) with the same
+    poll()/terminate() an afplay Popen has. winsound has no volume, so a volume other than 1 plays a scaled
+    copy of the WAV (16-bit only; others play as they are), cached under ~/.desk-buddy/cache."""
+
+    def __init__(self, path, volume):
+        import winsound
+        self.winsound = winsound
+        try:
+            with wave.open(path) as w:
+                length = w.getnframes() / w.getframerate()
+        except Exception:
+            length = 5.0
+        self.until = time.time() + length
+        winsound.PlaySound(self.scaled(path, volume), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+
+    @staticmethod
+    def scaled(path, volume):
+        try: volume = float(volume)
+        except (TypeError, ValueError): volume = 1.0
+        if abs(volume - 1.0) < 0.01:
+            return path
+        import array
+        out_dir = os.path.join(HOME, "cache", "sounds")
+        out = os.path.join(out_dir, "%s-v%.2f.wav" % (os.path.splitext(os.path.basename(path))[0], volume))
+        try:
+            if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(path):
+                return out
+            with wave.open(path) as w:
+                params, frames = w.getparams(), w.readframes(w.getnframes())
+            if params.sampwidth != 2:
+                return path
+            a = array.array("h", frames)
+            if sys.byteorder == "big": a.byteswap()
+            a = array.array("h", (max(-32768, min(32767, int(v * volume))) for v in a))
+            if sys.byteorder == "big": a.byteswap()
+            os.makedirs(out_dir, exist_ok=True)
+            tmp = out + ".tmp"
+            with wave.open(tmp, "wb") as w:
+                w.setparams(params); w.writeframes(a.tobytes())
+            os.replace(tmp, out)
+            return out
+        except Exception as e:
+            log.info("can't scale %s: %s", path, e)
+            return path
+
+    def poll(self):
+        return None if time.time() < self.until else 0
+
+    def terminate(self):
+        self.winsound.PlaySound(None, 0)          # stops whatever winsound is playing
+        self.until = 0
+
+
+def start_sound(path, volume):
+    """Start playing a WAV: afplay on the Mac, winsound on Windows. Returns something with poll()/terminate()."""
+    if IS_WIN:
+        return WinSound(path, volume)
+    return subprocess.Popen(["afplay", "-v", str(volume), path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 class Sounds:
-    """Plays Lump's voice through afplay. Settings are re-read whenever sounds.json changes, so
+    """Plays Lump's voice through afplay (winsound on Windows). Settings are re-read whenever sounds.json changes, so
     flipping "enabled" (Claude Switcher, POST /sound, or by hand) takes effect immediately.
       {"enabled": true, "volume": 1.0, "quiet_at_night": true,
        "moments": {"needs_you": {"on": true, "pick": ["a", "c"]}, ...}}
@@ -462,7 +1254,7 @@ class Sounds:
         try:
             m = os.path.getmtime(SOUNDS_FILE)
             if m != self.mtime:
-                with open(SOUNDS_FILE) as f:
+                with open(SOUNDS_FILE, encoding="utf-8") as f:
                     self.cfg = json.load(f)
                 self.mtime = m
         except FileNotFoundError:
@@ -476,7 +1268,7 @@ class Sounds:
             cfg = dict(self.settings())
             cfg["enabled"] = (not cfg.get("enabled", False)) if value == "toggle" else bool(value)
             tmp = SOUNDS_FILE + ".tmp"
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)
             os.replace(tmp, SOUNDS_FILE)
             log.info("sounds %s", "on" if cfg["enabled"] else "off")
@@ -509,8 +1301,7 @@ class Sounds:
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()                         # one voice at a time
             try:
-                self.proc = subprocess.Popen(["afplay", "-v", str(cfg.get("volume", 1.0)), path],
-                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.proc = start_sound(path, cfg.get("volume", 1.0))
             except Exception as e:
                 log.info("afplay failed: %s", e); return False
             self.last_any = self.last_at[moment] = now
@@ -521,7 +1312,10 @@ class Sounds:
 
     def play_gag(self, event, force=False):
         """The board started a gag (event "tap_<gag>_<mood>"): play its sound in step with the drawings,
-        at the volume from sounds.json. On/off: "enabled" and the "tap_gags" moment (on if missing)."""
+        at the volume from sounds.json. On/off: "enabled" and the "tap_gags" moment (on if missing).
+        Only a gag and mood the board really has (gag_event_ok) is ever turned into a file name."""
+        if not gag_event_ok(event):
+            log.info("no such gag: %r", str(event)[:40]); return False
         gag, _, mood = event[4:].rpartition("_")
         if gag == "prep" and mood == "meeting":
             gag = "prep_alarm"                                # at the alarm itself, prep starts with the clock ringing
@@ -537,7 +1331,7 @@ class Sounds:
                     length = w.getnframes() / w.getframerate()
             except Exception:
                 length = 5.0
-            delay = max(0.0, (0 if gag == "startle" else GAG_LEAD) - AFPLAY_LAG)
+            delay = max(0.0, (0 if gag == "startle" else GAG_LEAD) - (WINSOUND_LAG if IS_WIN else AFPLAY_LAG))
             if self.gag_timer:
                 self.gag_timer.cancel()
             self.gag_until = time.time() + delay + length
@@ -552,7 +1346,7 @@ class Sounds:
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()                         # one voice at a time
             try:
-                self.proc = subprocess.Popen(["afplay", "-v", str(volume), path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.proc = start_sound(path, volume)
             except Exception as e:
                 log.info("afplay failed: %s", e); return
             self.last_any = time.time()
@@ -606,12 +1400,70 @@ def meeting_blend(base, t):
     return oklch_to_hex(L1 + (L2 - L1) * t, max(0.13, C1 + (C2 - C1) * t), (H1 + dh * t + 360) % 360)
 
 
-def usage_colour(frac):
+def body_colour():
+    """His everyday colour: config.json "body_colour" (RRGGBB, set from Lump Control), else Tangerine."""
+    c = str(read_config().get("body_colour") or "").strip().lstrip("#").upper()
+    return c if re.fullmatch(r"[0-9A-F]{6}", c) else DEFAULT_COLOUR
+
+
+def usage_colour(frac, base=DEFAULT_COLOUR):
+    """The usage gauge: his own colour until half the limit, then warming to the same reds whatever that colour
+    is (so the warning keeps its meaning), grey at the limit."""
     frac = max(0.0, min(1.0, frac))
-    for (f0, c0), (f1, c1) in zip(USAGE_STOPS, USAGE_STOPS[1:]):
+    stops = [(f, base if c == DEFAULT_COLOUR else c) for f, c in USAGE_STOPS]
+    for (f0, c0), (f1, c1) in zip(stops, stops[1:]):
         if frac <= f1:
             return _mix(c0, c1, 0 if f1 == f0 else (frac - f0) / (f1 - f0))
-    return USAGE_STOPS[-1][1]
+    return stops[-1][1]
+
+
+class StallWatch:
+    """Records where the bridge is stuck if it ever freezes. The tick loop re-arms it every second; if a round
+    takes longer than STALL_SECS (a lock held, a call that never returns, or the whole process stuck), Python's
+    faulthandler dumps every thread's stack into stalls.log from its own C-level thread, which works even when
+    no Python code can run. When the loop comes round again, bridge.log notes how long it was stuck."""
+
+    def __init__(self, path=None, secs=None, clock=time.time):
+        import faulthandler
+        self.faulthandler, self.secs, self.clock = faulthandler, secs or STALL_SECS, clock
+        self.path, self.file, self.last, self.stamped = path or STALLS_FILE, None, None, 0.0
+        self._open()
+
+    def _open(self):
+        try:
+            if os.path.getsize(self.path) > 1_000_000:          # keep it small: one older copy
+                os.replace(self.path, self.path + ".1")
+        except OSError:
+            pass
+        try:
+            self.file = open(self.path, "a", encoding="utf-8")
+        except OSError as e:
+            self.file = None
+            log.info("stall watchdog off: can't open %s: %s", self.path, e)
+
+    def arm(self):
+        now = self.clock()
+        if self.last is not None and now - self.last > self.secs:
+            log.info("the bridge was stuck for %.0f s (where: %s)", now - self.last, self.path)
+        self.last = now
+        if not self.file:
+            return
+        if now - self.stamped >= 60:            # a time mark a minute, so a dump can be dated without the file growing fast
+            self.stamped = now
+            if self.file.tell() > 1_000_000:
+                self.faulthandler.cancel_dump_traceback_later()
+                self.file.close()
+                self._open()
+                if not self.file:
+                    return
+            self.file.write(time.strftime("--- %Y-%m-%d %H:%M:%S\n", time.localtime(now)))
+            self.file.flush()
+        self.faulthandler.dump_traceback_later(self.secs, repeat=False, file=self.file)
+
+    def stop(self):
+        self.faulthandler.cancel_dump_traceback_later()
+        if self.file:
+            self.file.close(); self.file = None
 
 
 class Buddy:
@@ -625,6 +1477,8 @@ class Buddy:
         self.usage = {}                # from the status line: five_hour / seven_day pct + resets
         self.sent_colour = None
         self.sent_prep = None          # meeting countdown flag last sent (p 0 / p 1)
+        self.preview = None            # a mood sent by hand (POST /cmd "s <mood>"), shown until we next send one
+        self.last_event_anim = None    # the board's latest one-off animation: {"name", "at"} (see note_event)
         self.meeting_alerted = set()   # meeting start times we've already announced
         self.last_oops = 0.0
         self.resync_at = 0.0
@@ -663,14 +1517,14 @@ class Buddy:
         if data == self.saved:
             return
         tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(data)
         os.replace(tmp, STATE_FILE)
         self.saved = data
 
     def load_state(self):
         try:
-            with open(STATE_FILE) as f:
+            with open(STATE_FILE, encoding="utf-8") as f:
                 st = json.load(f)
         except FileNotFoundError:
             return
@@ -843,6 +1697,16 @@ class Buddy:
             self.tapped()
         elif text.startswith("gag "):
             self.gag_sound(text[4:].strip())
+        elif text.startswith("event "):
+            self.note_event(text[6:].strip())
+
+    EVENT_NAME = re.compile(r"[a-z0-9_]{1,48}")
+
+    def note_event(self, name):
+        """The board started a one-off animation (firmware "event <name>": a gag, fidget, oops, hello). /status
+        reports it for a little while, so a window mirroring him can play the same drawings in step."""
+        if self.EVENT_NAME.fullmatch(name or ""):
+            self.last_event_anim = {"name": name, "at": time.time()}
 
     def gag_sound(self, event):
         """A gag just started on the board: its sound, unless it's night and you've not been around
@@ -939,7 +1803,7 @@ class Buddy:
 
     def next_meeting(self, now):
         try:
-            with open(MEETINGS_FILE) as f:
+            with open(MEETINGS_FILE, encoding="utf-8") as f:
                 ms = json.load(f)
         except Exception:
             return None
@@ -981,6 +1845,7 @@ class Buddy:
                     self.sound("goodnight")
             if self.dev.send("s " + m):
                 self.sent_mood = m
+                self.preview = None
         colour = self.colour(now)
         if force or colour != self.sent_colour:
             if self.dev.send("c " + colour):
@@ -1007,11 +1872,12 @@ class Buddy:
         return max(fr) if fr else None
 
     def colour(self, now):
-        """Meeting countdown beats the usage gauge, which beats plain Tangerine."""
-        base = DEFAULT_COLOUR
+        """Meeting countdown beats the usage gauge, which beats his everyday colour (Tangerine unless you
+        picked another in Lump Control)."""
+        base = body_colour()
         frac = self.usage_frac(now)
         if frac is not None:
-            base = usage_colour(round(frac * 50) / 50)      # 2% steps: no flicker
+            base = usage_colour(round(frac * 50) / 50, base)      # 2% steps: no flicker
         m = self.next_meeting(now)
         if m:
             until = m["start"] - now
@@ -1021,9 +1887,11 @@ class Buddy:
                 return meeting_blend(base, round((1 - until / MEETING_LEAD) * 40) / 40)
         return base
 
-    def set_usage(self, rl, source="statusline", account=PERSONAL):
+    def set_usage(self, rl, source="statusline", account=PERSONAL, at=None):
         """Usage readings from the Claude Code status line, or the Claude app's usage ring. Each account
-        has its own limits (keys "five_hour", "work:five_hour", ...); the colour follows the busiest."""
+        has its own limits (keys "five_hour", "work:five_hour", ...); the colour follows the busiest.
+        at: when the reading was taken, if that's not now (the desktop app's usage history): it then never
+        replaces a reading taken after it."""
         changed = False
         with self.lock:
             for window in ("five_hour", "seven_day"):
@@ -1031,13 +1899,22 @@ class Buddy:
                 w = (rl or {}).get(window)
                 if isinstance(w, dict) and w.get("used_percentage") is not None:
                     old = self.usage.get(key, {})
+                    if at is not None and old.get("t", 0) > at:
+                        continue                                   # we already have a fresher reading
                     resets = w.get("resets_at") or (old.get("resets") if source == "app" else None)
-                    new = {"pct": float(w["used_percentage"]), "resets": resets, "t": time.time(), "source": source}
+                    new = {"pct": float(w["used_percentage"]), "resets": resets, "t": time.time() if at is None else at, "source": source}
                     changed |= old.get("pct") != new["pct"]
                     self.usage[key] = new
         if changed:
             log.info("usage %s", {k: round(v["pct"]) for k, v in self.usage.items()})
         self.update()
+
+    def note_command(self, text):
+        """A raw command went to the board (POST /cmd). A mood sent that way (a preview from Lump Control, or
+        "s demo") is what he shows until the bridge next sends his real mood, so /status reports it as "shown"."""
+        m = re.fullmatch(r"s\s+([a-z]+)", text.strip())
+        if m:
+            self.preview = m.group(1)
 
     def resend(self):
         self.sent_mood = self.sent_overlay = self.sent_colour = self.sent_prep = None
@@ -1046,6 +1923,15 @@ class Buddy:
             self.woke_at = time.time()
             self.sound("waking_up")
         self.update()
+        self.send_tap_threshold()
+
+    def send_tap_threshold(self):
+        """The board forgets its tap sensitivity when it restarts: resend the one in config.json, if any
+        (set from Lump Control). Without one the board keeps its own default."""
+        try: t = float(read_config().get("tap_threshold") or 0)
+        except (TypeError, ValueError): return
+        if t:
+            self.dev.send(f"T {t:.2f}")
 
     def sound_tick(self, now):
         """Sounds that come from time passing rather than from a hook."""
@@ -1091,7 +1977,9 @@ class Buddy:
     def _tick(self):
         # Nothing in here may kill this loop: it drives the board, the heartbeat and saving. (If it
         # did die anyway, the heartbeat would stop and the board would show he's on his own.)
+        watch = StallWatch()
         while True:
+            watch.arm()
             time.sleep(1)
             try: self.tick(time.time())
             except Exception: log.exception("tick failed")
@@ -1114,8 +2002,14 @@ class Buddy:
         with self.lock:
             now = time.time()
             app = getattr(self, "app", None)
-            return {"mood": self.mood_locked(now), "sent": self.sent_mood, "counts": self.counts_locked(now), "device": self.dev.connected, "link": getattr(self.dev, "link", None),
-                    "colour": self.colour(now), "usage": self.usage,
+            mood = self.mood_locked(now)
+            ev = self.last_event_anim
+            playing = {"name": ev["name"], "age": round(now - ev["at"], 2)} if ev and 0 <= now - ev["at"] < 30 else None
+            relay_status = getattr(self.dev, "relay_status", None)
+            relay = relay_status() if callable(relay_status) else None      # None: no relay_token, no listener
+            return {"mood": mood, "shown": self.preview or mood, "playing": playing, "sent": self.sent_mood, "counts": self.counts_locked(now), "device": self.dev.connected, "link": getattr(self.dev, "link", None),
+                    "relay": relay, "relay_board": relay["board"] if relay else None,
+                    "colour": self.colour(now), "usage": self.usage, "apps": APPS.list(),
                     "sound": bool(self.sounds.settings().get("enabled")),
                     "next_meeting": self.next_meeting(now),
                     "focus": {"claude_in_front": self.focus.front, "account": getattr(self.focus, "account", None), "code_session": (self.focus.code_session or "")[:8],
@@ -1318,6 +2212,8 @@ class SlackWatch:
         """Is Slack the app you're using right now? (Then a plane is just noise, and a VIP message you're
         reading as it lands shouldn't get the whole letter routine.)"""
         try:
+            if IS_WIN:
+                return win_foreground()[1].replace("/", "\\").lower().rsplit("\\", 1)[-1] == "slack.exe"
             asn = subprocess.run(["lsappinfo", "front"], capture_output=True, text=True, timeout=2).stdout.strip()
             out = subprocess.run(["lsappinfo", "info", "-only", "bundleID", asn], capture_output=True, text=True, timeout=2).stdout
             return "com.tinyspeck.slackmacgap" in out
@@ -1434,6 +2330,55 @@ class SlackWatch:
             self.buddy.slack_plane(plane[1], plane[0])
 
 
+class AppUsageFile:
+    """Windows: usage from the Claude desktop app's own history file (plan-usage-history.json in each copy's
+    data folder: {"samples": [{"t": ms, "org": ..., "u": {"fh": 5-hour %, "sd": weekly %}}]}), written about
+    every 15 minutes. The desktop app has no status line, so this is how his colour follows your limits there.
+    Every Claude app on the computer is read, each as its own account (class ClaudeApps).
+    Only a sample newer than the last one taken is fed, stamped with its own time, so a fresher status-line
+    reading (from a CLI session) is never overwritten by it."""
+
+    EVERY = 60
+    MAX_AGE = 30 * 60                     # an older newest sample means the app isn't running: ignore it
+    NAME = "plan-usage-history.json"
+
+    def __init__(self, buddy, support=None, start=True):
+        self.buddy, self.support, self.fed = buddy, support or APP_SUPPORT, {}
+        if start:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            try: self.poll(time.time())
+            except Exception as e: log.info("app usage check failed: %s", e)
+            time.sleep(self.EVERY)
+
+    def poll(self, now):
+        APPS.detect()
+        apps = ClaudeApps(self.support) if self.support else APPS
+        if apps is not APPS:
+            apps.running = APPS.running
+        for app in apps.list():
+            path, acct = os.path.join(app["path"], self.NAME), app["account"]
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    samples = json.load(f).get("samples") or []
+            except Exception as e:
+                log.info("can't read %s: %s", path, e); continue
+            good = [s for s in samples if isinstance(s, dict) and isinstance(s.get("t"), (int, float)) and isinstance(s.get("u"), dict)]
+            if not good:
+                continue
+            s = max(good, key=lambda s: s["t"])
+            t = s["t"] / 1000
+            if now - t > self.MAX_AGE or t <= self.fed.get(acct, 0):
+                continue
+            self.fed[acct] = t
+            rl = {w: {"used_percentage": s["u"][k]} for w, k in (("five_hour", "fh"), ("seven_day", "sd")) if isinstance(s["u"].get(k), (int, float))}
+            self.buddy.set_usage(rl, source="app", account=acct, at=t)
+
+
 buddy = None
 
 
@@ -1460,10 +2405,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 p = json.loads(body or b"{}") or {}
                 buddy.set_usage(p.get("rate_limits"), account=account_of_config(p.get("transcript_path")))
             except Exception as e: log.info("bad usage payload: %s", e)
+        elif self.path == "/resync":              # resend everything he should be showing (after a test from Lump Control)
+            buddy.update(force=True); self._reply(200, b"ok")
         elif self.path == "/calendar":            # re-read the calendar now
             buddy.calendar.refresh_now(); self._reply(200, b"refreshing")
         elif self.path == "/cmd":
-            ok = buddy.dev.send(body.decode().strip()); self._reply(200 if ok else 503, b"ok" if ok else b"board not connected")
+            text = body.decode().strip()
+            ok = buddy.dev.send(text)
+            if ok: buddy.note_command(text)
+            self._reply(200 if ok else 503, b"ok" if ok else b"board not connected")
         elif self.path == "/play":                # an animation by name (GET /play lists them)
             ok = buddy.play(body.decode())
             if ok is None: self._reply(404, b"no such animation (GET /play lists them)")
@@ -1497,5 +2447,7 @@ if __name__ == "__main__":
     buddy.app = AppPages(buddy)
     buddy.calendar = Calendar()
     buddy.slack = SlackWatch(buddy)
+    if IS_WIN:
+        buddy.app_usage = AppUsageFile(buddy)
     log.info("desk-buddy bridge listening on 127.0.0.1:%d", HTTP_PORT)
     http.server.ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), Handler).serve_forever()

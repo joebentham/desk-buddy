@@ -29,7 +29,9 @@
 //                     sends this so the password never passes through the bridge or its log),
 //                     then restart. "w" alone forgets them.
 // The board prints "tap" when the glass is tapped (and giggles itself when that makes sense).
-// It prints "gag tap_<gag>_<mood>" the moment a gag starts playing (the bridge plays its sound in step).
+// It prints "gag tap_<gag>_<mood>" the moment a gag starts playing (the bridge plays its sound in step),
+// and "event <name>" the moment any one-off animation starts (gags, fidgets, oops, hello: the exact
+// sequence name), so a window can play the same drawings in step.
 //
 // On his own: with no word from the bridge for a minute (or since boot) he's "offline": he
 // drops what he was showing, idles and fidgets (asleep at night if a heartbeat ever told him the
@@ -212,7 +214,10 @@ static int lastFrame = -1;
 static float fps = 0;
 
 static void say(const char* fmt, ...);   // below, with the link code
-static void startSeq(int s) { curSeq = s; seqStart = millis(); lastFrame = -1; }
+static void startSeq(int s) {
+  curSeq = s; seqStart = millis(); lastFrame = -1;
+  if (A.kind[s] == EVENT) say("event %s", A.name[s].c_str());   // what he's playing, for anyone mirroring him
+}
 static int nextHop(int a, int b) {
   if (A.transOf[a][b] >= 0) return A.transOf[a][b];
   if (A.base[a] != a) return A.transOf[a][A.base[a]];

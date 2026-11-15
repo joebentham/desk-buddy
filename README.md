@@ -25,10 +25,10 @@ plays back at 24 fps.
   [this AliExpress listing](https://www.aliexpress.com/item/1005009887388696.html), colour option
   **ESP32-S3-LCD-1.3-C** (about $20). Keep its stock case: the mount is sized for it.
 - **A USB-C data cable** for the first flash. After Wi-Fi setup he only needs power.
-- **A Mac.** The bridge that connects Claude to Lump is macOS-only (launchd, a small Swift helper,
-  `afplay`). The firmware itself doesn't care.
-- **Claude Code**, plus optionally the Claude desktop app (for Chat and Cowork states).
-- [PlatformIO](https://platformio.org/) (`brew install platformio`), Python 3, and the Xcode
+- **A Mac or a Windows PC** for the bridge that connects Claude to Lump. The firmware itself doesn't
+  care. Windows has its own setup: see [Setup on Windows](#setup-on-windows).
+- **Claude Code**, plus optionally the Claude desktop app (for Chat and Cowork states, Mac only).
+- On a Mac: [PlatformIO](https://platformio.org/) (`brew install platformio`), Python 3, and the Xcode
   command line tools (`xcode-select --install`).
 - Optional: a 3D printer for the [monitor mount](enclosure/print/), which holds him on the back of your monitor, peeking over the top.
 
@@ -82,6 +82,137 @@ charger, such as a monitor's power-only port. Updates then go over the air:
 ```bash
 python3 tools/ota.py
 ```
+
+### Setup on Windows
+
+Same steps, Windows tools. You need [Python 3](https://www.python.org/downloads/) and
+[Git for Windows](https://git-scm.com/download/win) (Claude Code runs Lump's hooks in its Git Bash).
+Run these in PowerShell from the repo folder:
+
+**1. Flash the board.** Installs PlatformIO and esptool into `tools\.venv` the first time, builds, and
+writes the firmware and drawings in about a minute (`-NoArt` skips the drawings):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\windows\flash.ps1
+```
+
+**2. Install the bridge.** Sets up `~\.desk-buddy`, makes his sounds, and starts the bridge at logon from a
+shortcut in your Startup folder (no admin rights needed; it shows under Task Manager › Startup apps).
+`-Uninstall` removes it again.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\windows\install.ps1
+```
+
+**3. Hook up Claude Code.** The same hooks as on the Mac, so a `settings.json` you share between machines
+stays valid on all of them. Works for Claude Code in the terminal and in the Claude desktop app's Code tab.
+
+```powershell
+python tools\install_hooks.py
+```
+
+**4. Optional: Wi-Fi** (cable still plugged in, 2.4 GHz only), then over-the-air updates:
+
+```powershell
+~\.desk-buddy\venv\Scripts\python tools\wifi_setup.py
+~\.desk-buddy\venv\Scripts\python tools\ota.py
+```
+
+**Lump Control.** The installer also puts a small Lump in your system tray (it starts at logon too). Click
+him for a window with Lump himself on the left, live: the board's own frames in his current mood and colour,
+with his counters and usage. On the right: Status (sessions), Play (every gag, mood previews, tap
+sensitivity), Sounds (on/off, volume, each moment) and Settings (body colour, Wi-Fi host, calendar, Slack),
+in dark or light mode. Right-click for quick play, sound on/off and restarting the bridge. The window is a
+small HTML page in Windows' own WebView2 (pywebview); it only talks to the bridge's local API and its
+settings files, so changes apply straight away.
+
+How it differs from the Mac: his usage colour also follows the desktop app (which has no status line) by
+reading its own usage history, sounds play through Windows, and Chat and Cowork states aren't tracked
+yet (Code sessions are). `tools\windows\bridge.ps1 -Status | -Stop | -Start` checks or restarts the bridge;
+its log is `~\.desk-buddy\bridge.log`.
+
+### Lump on another computer (remote link)
+
+For when Claude runs on one Windows PC (the **Claude PC**, with the bridge) and you work from another one,
+over Remote Desktop say, with Lump plugged into that one (**Lump's PC**). A small relay on Lump's PC dials
+out to the bridge over [Tailscale](https://tailscale.com) and passes Lump's lines back and forth, so he
+follows your Claude sessions whether or not the Remote Desktop session is connected, and finds his way back
+by himself after restarts, sleep and unplugging. Both PCs need Tailscale on the same tailnet with MagicDNS
+on. Lump's PC needs Python 3 and a copy of this repo, but no admin rights, no open port and no firewall change.
+
+**1. On the Claude PC** (bridge already installed):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\windows\install.ps1 -AllowRelay
+```
+
+This makes a relay token (`relay_token` in `~\.desk-buddy\config.json`), and runs
+`tailscale serve --bg --tcp 4211 tcp://127.0.0.1:4211`, which passes port 4211 from your tailnet (and only your
+tailnet: this isn't Funnel) to the bridge, which listens on 127.0.0.1 only. It then prints the command for
+Lump's PC, with this PC's Tailscale name filled in and without the token.
+
+**2. On Lump's PC**, in the repo folder, run the printed command. It looks like:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\windows\install.ps1 -Relay -BridgeHost claude-pc.your-tailnet.ts.net
+```
+
+It asks for the token at a hidden prompt: in Lump Control on the Claude PC, Settings › Remote Lump › **Copy
+token**, then paste (Remote Desktop shares the clipboard). `-TokenFile <path>` reads it from a file instead. The
+token is never a command-line argument, so it doesn't end up in a shell history or the process list. The
+installer refuses if the bridge is installed on Lump's PC too, since both would want his USB port; `-Force`
+stops that bridge and takes it out of startup.
+
+Lump Control's Status tab then shows him on the remote link, and whether his board is plugged in over there.
+**New token** (Settings › Remote Lump) disconnects the relay until you run step 2 again with the new one.
+
+**What runs on Lump's PC:** a visible `pythonw.exe` process running `~\.desk-buddy\lump_relay.py`, started at
+logon by a **Lump relay** shortcut in your Startup folder, with a small Python environment (pyserial only) in
+`~\.desk-buddy\venv`, its settings and token in `~\.desk-buddy\relay.json`, and its log in
+`~\.desk-buddy\relay.log` (never the token). It only opens Lump's own USB-serial chip and only makes one outgoing
+connection, over Tailscale to the Claude PC's port 4211; it checks the name resolves to a Tailscale address
+before sending anything.
+
+**What flows each way:** to Lump, the bridge's display commands: his mood, colour, the three corner counts, the
+meeting-countdown flag and a heartbeat carrying the time of day. The relay passes only those kinds of line and
+refuses everything else, including the command that changes his Wi-Fi settings (the bridge never sends that
+either). From Lump: taps, which gag he's playing, his start-up line, and every 10 s whether he's plugged in. No
+prompts, code, file names or session titles cross the link, only moods and counts. Sounds still play on the
+Claude PC (you hear them through Remote Desktop while it's connected).
+
+**What the administrators of Lump's PC can learn:** they can see the relay process and its connection to your
+Claude PC, read the token in `relay.json` and the log, and watch the lines above (when you're busy, when
+Claude is waiting on you, how close to your usage limits you are, and the time of day). Someone with the token
+and a way onto your tailnet could pretend to be the relay, so the bridge treats the relay as untrusted: it
+takes nothing from it but taps, known gag names and the start-up line (rate-limited, short lines only), sends
+it nothing but the display commands, and drops it after 30 s of silence. **New token** shuts out an old copy.
+
+**Recommended: limit port 4211 to Lump's PC** with a Tailscale access rule (admin console › Access controls).
+Tailscale's default policy lets every device on your tailnet reach every port; rules only ever add access, so
+replace the allow-all rule with ones like these (use each PC's `tailscale ip -4`):
+
+```jsonc
+{
+  "hosts": {
+    "claude-pc": "100.x.y.z",
+    "lump-pc":   "100.a.b.c"
+  },
+  "acls": [
+    // only Lump's PC reaches the relay port on the Claude PC
+    {"action": "accept", "src": ["lump-pc"], "dst": ["claude-pc:4211"]},
+    // and whatever else you use, e.g. Remote Desktop from Lump's PC
+    {"action": "accept", "src": ["lump-pc"], "dst": ["claude-pc:3389"]}
+  ]
+}
+```
+
+**If Lump's PC is a work computer,** check that your employer allows Tailscale and USB devices on it first. The
+relay isn't hidden: it shows in Task Manager, the Startup folder and the network connections.
+
+**To remove it:** on Lump's PC, `install.ps1 -Uninstall` stops the relay and deletes its shortcut and
+`relay.json` (delete `~\.desk-buddy` too if nothing else lives there). On the Claude PC,
+`install.ps1 -AllowRelay -Off` removes only the Tailscale serve entry for port 4211 and the token; the bridge
+then drops the relay and stops listening within a few seconds.
 
 ### Optional extras
 
@@ -153,8 +284,10 @@ calendar / Slack ──┘   one mood for all sessions                   plays b
 | `tools/appwatch/` | Swift helper that reads Chat/Cowork state from the Claude app's accessibility tree |
 | `tools/lumpbar/` | Lump on your Mac: frame baker (`bake.py`) and the notch/menu bar app (`main.swift`) |
 | `tools/flash.sh`, `tools/ota.py`, `tools/wifi_setup.py` | Getting firmware and drawings onto the board |
+| `tools/windows/` | Windows: `flash.ps1`, `install.ps1` (bridge at logon, `-AllowRelay` / `-Relay` for the remote link), `bridge.ps1` (start/stop/status), `keepalive.py`, `control.py` (Lump Control tray app) |
+| `tools/lump_relay.py` | The remote link's relay, on the computer Lump is plugged into when Claude runs on another |
 | `enclosure/` | OpenSCAD source for the adjustable monitor mount, with [ready-to-print STLs](enclosure/print/) |
-| `tests/` | Bridge tests (no board needed): `~/.desk-buddy/venv/bin/python -m unittest discover -s tests` |
+| `tests/` | Bridge tests (no board needed): `~/.desk-buddy/venv/bin/python -m unittest discover -s tests` (Windows: `venv\Scripts\python`) |
 
 The bridge's debug endpoints help when you're poking at him: `curl 127.0.0.1:47823/status`, or
 `curl -X POST --data "e tap" 127.0.0.1:47823/cmd` to send a raw command. To play an animation on
