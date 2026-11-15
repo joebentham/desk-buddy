@@ -10,7 +10,7 @@ local files, and POSTs the ones that differ; the board checks each upload's hash
 bar, and restarts. Uses the pairing token and host from ~/.desk-buddy/config.json (written by
 tools/wifi_setup.py). A cable is only needed for a new partition layout or recovery: tools/flash.sh.
 """
-import argparse, hashlib, json, os, socket, subprocess, sys, time, urllib.error, urllib.request
+import argparse, hashlib, json, os, shutil, socket, subprocess, sys, time, urllib.error, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, "firmware", ".pio", "build", "buddy", "firmware.bin")
@@ -84,7 +84,9 @@ def main():
 
     if want_app and not a.no_build:
         print("building...", flush=True)
-        r = subprocess.run(["pio", "run"], cwd=os.path.join(ROOT, "firmware"), capture_output=True, text=True)
+        # pio on PATH (the Mac: brew); on Windows tools/windows/flash.ps1 installs it into tools/.venv instead
+        pio = shutil.which("pio") or os.path.join(ROOT, "tools", ".venv", "Scripts", "pio.exe")
+        r = subprocess.run([pio, "run"], cwd=os.path.join(ROOT, "firmware"), capture_output=True, text=True)
         if r.returncode:
             sys.exit(r.stdout[-3000:] + r.stderr[-2000:] + "\nbuild failed")
     for kind, path, want in (("app", APP, want_app), ("art", ART, want_art)):

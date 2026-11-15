@@ -25,10 +25,10 @@ plays back at 24 fps.
   [this AliExpress listing](https://www.aliexpress.com/item/1005009887388696.html), colour option
   **ESP32-S3-LCD-1.3-C** (about $20). Keep its stock case: the mount is sized for it.
 - **A USB-C data cable** for the first flash. After Wi-Fi setup he only needs power.
-- **A Mac.** The bridge that connects Claude to Lump is macOS-only (launchd, a small Swift helper,
-  `afplay`). The firmware itself doesn't care.
-- **Claude Code**, plus optionally the Claude desktop app (for Chat and Cowork states).
-- [PlatformIO](https://platformio.org/) (`brew install platformio`), Python 3, and the Xcode
+- **A Mac or a Windows PC** for the bridge that connects Claude to Lump. The firmware itself doesn't
+  care. Windows has its own setup: see [Setup on Windows](#setup-on-windows).
+- **Claude Code**, plus optionally the Claude desktop app (for Chat and Cowork states, Mac only).
+- On a Mac: [PlatformIO](https://platformio.org/) (`brew install platformio`), Python 3, and the Xcode
   command line tools (`xcode-select --install`).
 - Optional: a 3D printer for the [monitor mount](enclosure/print/), which holds him on the back of your monitor, peeking over the top.
 
@@ -82,6 +82,54 @@ charger, such as a monitor's power-only port. Updates then go over the air:
 ```bash
 python3 tools/ota.py
 ```
+
+### Setup on Windows
+
+Same steps, Windows tools. You need [Python 3](https://www.python.org/downloads/) and
+[Git for Windows](https://git-scm.com/download/win) (Claude Code runs Lump's hooks in its Git Bash).
+Run these in PowerShell from the repo folder:
+
+**1. Flash the board.** Installs PlatformIO and esptool into `tools\.venv` the first time, builds, and
+writes the firmware and drawings in about a minute (`-NoArt` skips the drawings):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\windows\flash.ps1
+```
+
+**2. Install the bridge.** Sets up `~\.desk-buddy`, makes his sounds, and starts the bridge at logon from a
+shortcut in your Startup folder (no admin rights needed; it shows under Task Manager › Startup apps).
+`-Uninstall` removes it again.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\windows\install.ps1
+```
+
+**3. Hook up Claude Code.** The same hooks as on the Mac, so a `settings.json` you share between machines
+stays valid on all of them. Works for Claude Code in the terminal and in the Claude desktop app's Code tab.
+
+```powershell
+python tools\install_hooks.py
+```
+
+**4. Optional: Wi-Fi** (cable still plugged in, 2.4 GHz only), then over-the-air updates:
+
+```powershell
+~\.desk-buddy\venv\Scripts\python tools\wifi_setup.py
+~\.desk-buddy\venv\Scripts\python tools\ota.py
+```
+
+**Lump Control.** The installer also puts a small Lump in your system tray (it starts at logon too). Click
+him for a window with Lump himself on the left, live: the board's own frames in his current mood and colour,
+with his counters and usage. On the right: Status (sessions), Play (every gag, mood previews, tap
+sensitivity), Sounds (on/off, volume, each moment) and Settings (body colour, Wi-Fi host, calendar, Slack),
+in dark or light mode. Right-click for quick play, sound on/off and restarting the bridge. The window is a
+small HTML page in Windows' own WebView2 (pywebview); it only talks to the bridge's local API and its
+settings files, so changes apply straight away.
+
+How it differs from the Mac: his usage colour also follows the desktop app (which has no status line) by
+reading its own usage history, sounds play through Windows, and Chat and Cowork states aren't tracked
+yet (Code sessions are). `tools\windows\bridge.ps1 -Status | -Stop | -Start` checks or restarts the bridge;
+its log is `~\.desk-buddy\bridge.log`.
 
 ### Optional extras
 
@@ -153,8 +201,9 @@ calendar / Slack ──┘   one mood for all sessions                   plays b
 | `tools/appwatch/` | Swift helper that reads Chat/Cowork state from the Claude app's accessibility tree |
 | `tools/lumpbar/` | Lump on your Mac: frame baker (`bake.py`) and the notch/menu bar app (`main.swift`) |
 | `tools/flash.sh`, `tools/ota.py`, `tools/wifi_setup.py` | Getting firmware and drawings onto the board |
+| `tools/windows/` | Windows: `flash.ps1`, `install.ps1` (bridge at logon), `bridge.ps1` (start/stop/status), `keepalive.py`, `control.py` (Lump Control tray app) |
 | `enclosure/` | OpenSCAD source for the adjustable monitor mount, with [ready-to-print STLs](enclosure/print/) |
-| `tests/` | Bridge tests (no board needed): `~/.desk-buddy/venv/bin/python -m unittest discover -s tests` |
+| `tests/` | Bridge tests (no board needed): `~/.desk-buddy/venv/bin/python -m unittest discover -s tests` (Windows: `venv\Scripts\python`) |
 
 The bridge's debug endpoints help when you're poking at him: `curl 127.0.0.1:47823/status`, or
 `curl -X POST --data "e tap" 127.0.0.1:47823/cmd` to send a raw command. To play an animation on
