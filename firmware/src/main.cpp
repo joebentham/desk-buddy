@@ -16,11 +16,14 @@
 //                      sneeze, mooning, cartoon bomb; at night the late-night startle; during a meeting
 //                      countdown or alarm, meeting prep)
 //   p <0|1>           meeting countdown running (the bridge sends it): taps play meeting prep
-//   o <working> <waiting> <unseen>   corner extras: counts of sessions working, waiting on you,
-//                     and finished-but-not-looked-at (drawn over the animation)
+//   o <working> <waiting> <unseen>   counts of sessions working, waiting on you,
+//                     and finished-but-not-looked-at (ESP32-32E: bottom status band)
 //   c <RRGGBB>        body colour (fades over ~1 s); default Tangerine FF7A45
-//   i                 motion sensor stats: peak jolt in the last few seconds, taps seen, threshold
-//   T <g>             tap sensitivity: jolt (in g) that counts as a tap (default 0.35)
+//   i                 S3: IMU jolt; ESP32-32E: XPT2046 pressure, raw XY, taps, threshold
+//   T <value>         S3: jolt in g (default .35); ESP32-32E: pressure 1..4095 (default 600)
+//   P <invert 0|1> <bgr 0|1> <rotation 0..7>   ESP32-32E panel tuning until reset;
+//                     P alone reports it. BGR is MADCTL bit 3, invert selects INVON.
+//                     Default P 1 0 0: USB-C top, portrait 240x320, unmirrored.
 //   h <secs>          heartbeat from the bridge, with the local time of day (seconds since midnight);
 //                     no reply. Any command counts as hearing from the bridge.
 //   ?                 report state
@@ -61,20 +64,30 @@
 #include <Preferences.h>
 #include <time.h>
 #include <stdarg.h>
+#ifndef LUMP_NO_OTA
 #include <WebServer.h>
 #include <Update.h>
+#endif
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
+#include <spi_flash_mmap.h>
 #include "mbedtls/sha256.h"
 
+#ifdef BOARD_ESP32_32E
+#include "board_esp32_32e.h"
+constexpr const char* ART_RECOVERY_COMMAND = "tools/flash.sh esp32-32e";
+#else
 constexpr int PIN_SCLK = 40, PIN_MOSI = 41, PIN_DC = 38, PIN_CS = 39, PIN_RST = 42, PIN_BL = 20;
 constexpr bool PRISM_MIRROR = true;  // rotations 4–7 are mirrored for the prism
+constexpr const char* ART_RECOVERY_COMMAND = "tools/ota.py --art";
+#endif
 constexpr uint32_t ESCALATE_MS = 45000, LONGHAUL_MS = 10UL * 60 * 1000;
 constexpr uint8_t BL_DAY = 255, BL_NIGHT = 70;
 constexpr uint32_t HOST_TIMEOUT_MS = 60000;    // bridge heartbeats every 15 s
 constexpr uint32_t OFFLINE_MARK_AFTER_MS = 8000;  // at boot, give the bridge a moment before showing the mark
 constexpr uint8_t NIGHT_FROM = 0, NIGHT_UNTIL = 8;   // midnight to 8am; matches the bridge
 
+#ifndef BOARD_ESP32_32E
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_ST7789 panel;
   lgfx::Bus_SPI bus;
@@ -92,8 +105,12 @@ class LGFX : public lgfx::LGFX_Device {
     panel.config(p); setPanel(&panel);
   }
 };
+#endif
 static LGFX tft;
 static LGFX_Sprite fb(&tft);
+#ifdef BOARD_ESP32_32E
+static LGFX_Sprite bandFb(&tft); // 38,400 bytes; composed before one panel push
+#endif
 
 // ---------- animation data: the "lump" flash partition, memory-mapped ----------
 static const esp_partition_t* artPart = nullptr;
@@ -103,9 +120,23 @@ static esp_partition_mmap_handle_t artMap;
 static bool mapArt() {
   artPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x40, "lump");
   if (!artPart) return false;
+  size_t length = artPart->size;
+#ifdef BOARD_ESP32_32E
+  // Classic ESP32 has a 4 MB DROM window (64 x 64 KB pages), shared with program
+  // rodata. v4 records its exact length: map only live art, not partition padding.
+  uint8_t header[18];
+  if (esp_partition_read(artPart, 0, header, sizeof header) != ESP_OK ||
+      memcmp(header, "LUMP\x04\x00", 6) != 0) return false;
+  length = uint32_t(header[14]) | uint32_t(header[15]) << 8 | uint32_t(header[16]) << 16 | uint32_t(header[17]) << 24;
+  if (length < sizeof header || length > artPart->size || length > 0x270000) return false;
+#endif
   const void* ptr = nullptr;
-  if (esp_partition_mmap(artPart, 0, artPart->size, ESP_PARTITION_MMAP_DATA, &ptr, &artMap) != ESP_OK) return false;
-  art = (const uint8_t*)ptr; artSize = artPart->size;
+  Serial.printf("DROM pages free before art=%u, art needs=%u (64 KB pages)\n",
+                unsigned(spi_flash_mmap_get_free_pages(SPI_FLASH_MMAP_DATA)), unsigned((length + 65535) / 65536));
+  esp_err_t err = esp_partition_mmap(artPart, 0, length, ESP_PARTITION_MMAP_DATA, &ptr, &artMap);
+  if (err != ESP_OK) { Serial.printf("err art mmap bytes=%u: %s\n", unsigned(length), esp_err_to_name(err)); return false; }
+  art = (const uint8_t*)ptr; artSize = length;
+  Serial.printf("art mapped: %u bytes (partition %u)\n", unsigned(artSize), unsigned(artPart->size));
   return true;
 }
 
@@ -113,6 +144,7 @@ constexpr int MAX_MOODS = 12, MAX_SEQ = 250;
 enum Kind : uint8_t { LOOP = 0, TRANS = 1, EVENT = 2 };
 struct Anim {
   uint16_t nFrames = 0; uint8_t fps = 24, nMoods = 0, nSeqs = 0;
+  uint16_t width = 240, height = 240;
   uint8_t base[MAX_MOODS]; String moodName[MAX_MOODS];
   uint8_t kind[MAX_SEQ], from[MAX_SEQ], to[MAX_SEQ]; uint16_t len[MAX_SEQ]; const uint8_t* seq[MAX_SEQ]; String name[MAX_SEQ];
   int8_t loopOf[MAX_MOODS], transOf[MAX_MOODS][MAX_MOODS];
@@ -123,24 +155,45 @@ struct Anim {
 static inline uint16_t rd16(const uint8_t* p) { return p[0] | (p[1] << 8); }
 static inline uint32_t rd32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (uint32_t(p[3]) << 24); }
 static String rdStr(const uint8_t*& p) { int n = *p++; String s; s.reserve(n); for (int i = 0; i < n; i++) s += char(p[i]); p += n; return s; }
+static bool validMood(int m) { return m >= 0 && m < A.nMoods; }
+static int moodIndex(const String& n) { for (int m = 0; m < A.nMoods; m++) if (A.moodName[m] == n) return m; return -1; }
 
 // Every read is bounds-checked against the partition: half-written or garbage art must fail
 // cleanly (and leave Wi-Fi updates working), never crash.
 static bool parseAnim() {
+  A.ok = false;
+  A.width = A.height = 240;
   if (!art || artSize < 16) return false;
   const uint8_t* p = art; const uint8_t* end = art + artSize;
   auto room = [&](size_t n) { return size_t(end - p) >= n; };
   if (memcmp(p, "LUMP", 4) != 0) return false;
   p += 4;
-  if (rd16(p) != 3) return false; p += 2;
+  uint16_t version = rd16(p); p += 2;
+  if (version != 3 && version != 4) return false;
   A.nFrames = rd16(p); p += 2;
   A.nMoods = *p++; A.fps = *p++;
-  if (A.nMoods > MAX_MOODS) return false;
+  if (!A.nFrames || !A.fps || !A.nMoods || A.nMoods > MAX_MOODS) return false;
+  if (version == 4) {
+    if (!room(8)) return false;
+    A.width = rd16(p); A.height = rd16(p + 2); uint32_t length = rd32(p + 4); p += 8;
+    if (length < size_t(p - art) || length > artSize) return false;
+    artSize = length; end = art + length;
+  }
+#ifdef BOARD_ESP32_32E
+  if (A.width != 120 || A.height != 120) return false;
+#else
+  if (A.width != 240 || A.height != 240) return false;
+#endif
   for (int m = 0; m < A.nMoods; m++) {
     if (!room(2) || !room(2 + p[1])) return false;
     A.base[m] = *p++; A.moodName[m] = rdStr(p); A.loopOf[m] = -1;
-    if (A.base[m] >= A.nMoods) return false;
+    if (A.base[m] >= A.nMoods || !A.moodName[m].length()) return false;
+    for (int prev = 0; prev < m; ++prev) if (A.moodName[prev] == A.moodName[m]) return false;
   }
+  // Demo, offline mode and automatic escalation look these up by name. A file
+  // can have valid lengths, indices and RLE while a damaged name is missing.
+  for (const char* required : {"idle", "working", "alert", "done", "waiting", "longhaul", "night"})
+    if (moodIndex(required) < 0) return false;
   memset(A.transOf, -1, sizeof(A.transOf));
   if (!room(1)) return false;
   A.nSeqs = *p++;
@@ -148,6 +201,7 @@ static bool parseAnim() {
   for (int i = 0; i < A.nSeqs; i++) {
     if (!room(4) || !room(4 + p[3] + 2)) return false;
     A.kind[i] = p[0]; A.from[i] = p[1]; A.to[i] = p[2]; p += 3;
+    if (A.kind[i] > EVENT) return false;
     if (A.from[i] >= A.nMoods || A.to[i] >= A.nMoods) return false;
     A.name[i] = rdStr(p);
     A.len[i] = rd16(p); p += 2;
@@ -161,10 +215,26 @@ static bool parseAnim() {
   if (!room(size_t(A.nFrames) * 4)) return false;
   A.offsets = p; p += A.nFrames * 4;
   A.data = p;
-  for (int f = 0; f < A.nFrames; f++) if (rd32(A.offsets + 4 * f) >= size_t(end - A.data)) return false;
+  // Check every run once at boot. Decoding may then use direct flash pointers,
+  // including on a board with no PSRAM, without overreads or zero-run hangs.
+  for (int f = 0; f < A.nFrames; f++) {
+    uint32_t off = rd32(A.offsets + 4 * f);
+    uint32_t stop = f + 1 < A.nFrames ? rd32(A.offsets + 4 * (f + 1)) : end - A.data;
+    if (off >= stop || stop > size_t(end - A.data)) return false;
+    uint32_t pixels = 0;
+    for (; off < stop && pixels < uint32_t(A.width) * A.height; off += 3) {
+      if (stop - off < 3 || !A.data[off]) return false;
+      pixels += A.data[off];
+      if (pixels > uint32_t(A.width) * A.height) return false;
+    }
+    if (pixels != uint32_t(A.width) * A.height) return false;
+    // v3 has no file length: its final frame is followed by erased partition
+    // padding. v4 records its exact end; all earlier frames end at next offset.
+    if ((version == 4 || f + 1 < A.nFrames) && off != stop) return false;
+    if (!(f & 31)) delay(1);
+  }
   return A.ok = true;
 }
-static int moodIndex(const String& n) { for (int m = 0; m < A.nMoods; m++) if (A.moodName[m] == n) return m; return -1; }
 static int eventIndex(const String& n) { for (int i = 0; i < A.nSeqs; i++) if (A.kind[i] == EVENT && A.name[i] == n) return i; return -1; }
 
 // ---------- body colour ----------
@@ -193,11 +263,12 @@ static void decodeFrame(uint16_t idx) {
   uint16_t* out = (uint16_t*)fb.getBuffer();
   int i = 0;
   uint16_t lastIn = 0xFFFF, lastOut = 0;
-  while (i < 240 * 240) {
+  int pixels = A.width * A.height;
+  while (i < pixels) {
     int n = p[0]; uint16_t v = p[1] | (p[2] << 8); p += 3;
     if (v != lastIn) { lastIn = v; lastOut = recolor(v); }
     v = lastOut;
-    if (i + n > 240 * 240) n = 240 * 240 - i;
+    if (i + n > pixels) n = pixels - i;
     for (int k = 0; k < n; k++) out[i + k] = v;
     i += n;
   }
@@ -214,12 +285,14 @@ static float fps = 0;
 static void say(const char* fmt, ...);   // below, with the link code
 static void startSeq(int s) { curSeq = s; seqStart = millis(); lastFrame = -1; }
 static int nextHop(int a, int b) {
+  if (!A.ok || !validMood(a) || !validMood(b)) return -1;
   if (A.transOf[a][b] >= 0) return A.transOf[a][b];
   if (A.base[a] != a) return A.transOf[a][A.base[a]];
   if (A.base[b] != b && A.transOf[a][A.base[b]] >= 0) return A.transOf[a][A.base[b]];
   return -1;
 }
 static void settle(int m) {  // arrived in mood m's loop
+  if (!A.ok || !validMood(m) || !validMood(target)) return;
   curMood = m;
   if (target != m) {
     int h = nextHop(m, target);
@@ -241,9 +314,11 @@ static void settle(int m) {  // arrived in mood m's loop
   }
   startSeq(A.loopOf[m]); loopSince = millis();
 }
-static void setTarget(int m) {
+static bool setTarget(int m) {
+  if (!A.ok || !validMood(m)) return false;
   target = m;
   if (A.kind[curSeq] == LOOP) settle(curMood);
+  return true;
 }
 // returns false if there's no such event
 // Tapping the glass: in the daytime every tap gets one of his gags at random, never the same one twice
@@ -262,6 +337,7 @@ static const char* pickTap() {
   return GAG[0];
 }
 static bool playEvent(String n) {
+  if (!A.ok || !validMood(target)) return false;
   if (n == "tap") {
     const String& m = A.moodName[target];
     n = m == "night" ? String("tap_startle") : (prepMode || m == "meeting") ? String("tap_prep") : String("tap_") + pickTap();
@@ -290,16 +366,18 @@ static bool demo = false;
 static int demoStep = -1;
 static uint32_t demoNext = 0;
 static void runDemo(uint32_t now) {
-  if (!demo || now < demoNext) return;
+  if (!A.ok || !demo || now < demoNext) return;
   demoStep = (demoStep + 1) % (sizeof(DEMO) / sizeof(DEMO[0]));
   const Step& s = DEMO[demoStep];
-  if (s.type == 's') setTarget(moodIndex(s.name)); else playEvent(s.name);
+  if (s.type == 's') {
+    if (!setTarget(moodIndex(s.name))) { demo = false; say("err demo mood missing"); return; }
+  } else playEvent(s.name);
   demoNext = now + s.ms;
 }
 
 // ---------- things he does on his own ----------
 static void autoBehaviour(uint32_t now) {
-  if (demo || A.kind[curSeq] != LOOP || target != curMood) return;
+  if (!A.ok || demo || A.kind[curSeq] != LOOP || target != curMood) return;
   const String& m = A.moodName[curMood];
   if (m == "idle" && pendingEvent < 0) {
     if (!nextFidget) nextFidget = now + 40000 + random(50000);
@@ -308,27 +386,29 @@ static void autoBehaviour(uint32_t now) {
       nextFidget = 0; playEvent(F[random(3)]);
     }
   } else nextFidget = 0;
-  if (m == "alert" && now - loopSince > ESCALATE_MS) setTarget(moodIndex("waiting"));
-  if (m == "working" && now - loopSince > LONGHAUL_MS) setTarget(moodIndex("longhaul"));
+  if (m == "alert" && now - loopSince > ESCALATE_MS && !setTarget(moodIndex("waiting"))) say("err waiting mood missing");
+  if (m == "working" && now - loopSince > LONGHAUL_MS && !setTarget(moodIndex("longhaul"))) say("err longhaul mood missing");
 }
 
 // ---------- backlight: dims gently at night ----------
 static void backlight(uint32_t now) {
   static uint32_t last = 0; static float level = BL_DAY;
-  if (now - last < 20) return; last = now;
+  if (now - last < 20) return;
+  last = now;
   bool night = A.kind[curSeq] == LOOP && A.moodName[curMood] == "night";
   level += ((night ? BL_NIGHT : BL_DAY) - level) * 0.04f;
   analogWrite(PIN_BL, int(level));
 }
 
+static volatile bool tapPending = false;
+static volatile uint32_t tapCount = 0;
+#ifndef BOARD_ESP32_32E
 // ---------- motion sensor (QMI8658 on I2C SDA 47 / SCL 48): tapping the glass ----------
 // Sampled ~400x a second on core 0 so short taps aren't missed while core 1 is drawing.
 // A tap is a sharp jolt: the acceleration jumps away from its slow-moving average.
 constexpr int IMU_SDA = 47, IMU_SCL = 48;
 static uint8_t imuAddr = 0;
-static volatile bool tapPending = false;
 static volatile float tapThreshold = 0.35f, peakJolt = 0;
-static volatile uint32_t tapCount = 0;
 static bool imuWrite(uint8_t reg, uint8_t v) { Wire.beginTransmission(imuAddr); Wire.write(reg); Wire.write(v); return Wire.endTransmission() == 0; }
 static bool imuRead(uint8_t reg, uint8_t* buf, int n) {
   Wire.beginTransmission(imuAddr); Wire.write(reg); if (Wire.endTransmission(false) != 0) return false;
@@ -365,6 +445,31 @@ static void imuTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
+#else
+// Shared SPI bus: touch polling and drawing both run in loop(), with separate
+// transactions/CS lines. No competing core/task can corrupt a panel transfer.
+static uint16_t tapThreshold = 600, touchPressure = 0, touchPeak = 0;
+static int32_t touchX = 0, touchY = 0;
+static void pollTouch(uint32_t now) {
+  static uint32_t lastSample = 0, pressAt = 0, releaseAt = 0, lastTap = 0;
+  static bool latched = false;
+  if (now - lastSample < 20) return;
+  lastSample = now;
+  touchPressure = tft.rawTouch(&touchX, &touchY);
+  touchPeak = max(touchPeak, touchPressure);
+  if (touchPressure >= tapThreshold) {
+    releaseAt = 0;
+    if (!pressAt) pressAt = now;
+    if (!latched && now - pressAt >= 40 && now - lastTap >= 600) {
+      latched = true; lastTap = now; tapCount = tapCount + 1; tapPending = true;
+    }
+  } else {
+    pressAt = 0;
+    if (!releaseAt) releaseAt = now;
+    if (now - releaseAt >= 80) latched = false;
+  }
+}
+#endif
 
 // ---------- talking back: USB, and the Wi-Fi client if there is one ----------
 constexpr uint16_t NET_PORT = 4210;
@@ -399,9 +504,14 @@ static void heardFromHost() {
   if (was) say("resync");           // the bridge resends mood, colour and corner extras
 }
 static void runOffline(uint32_t now) {
-  if (!offline && !hostAlive(now)) {           // lost the bridge: forget what it last told us
+  if (!offline && !hostAlive(now)) {           // lost the bridge: return to autonomous behaviour
     offline = true;
-    ovWorking = ovWaiting = ovUnseen = 0; prepMode = false;
+#ifndef BOARD_ESP32_32E
+    ovWorking = ovWaiting = ovUnseen = 0;
+#endif
+    // The 32E band retains the last counts as a snapshot, marked OFF. This
+    // also keeps a USB counter demonstration visible after the port closes.
+    prepMode = false;
     goalR = 255; goalG = 122; goalB = 69;      // back to Tangerine (a usage or meeting colour would be stale)
   }
   if (!offline || demo) return;
@@ -410,6 +520,7 @@ static void runOffline(uint32_t now) {
 }
 static bool offlineMark(uint32_t now) { return offline && !demo && now > OFFLINE_MARK_AFTER_MS; }
 // a little unplugged cable, gently reaching for its socket
+#ifndef BOARD_ESP32_32E
 static void drawOfflineMark(uint32_t now) {
   float t = now / 1000.f, k = 0.45f + 0.3f * sinf(t * 2.1f);
   uint16_t c = lgfx::color565(255 * k, 241 * k, 220 * k);
@@ -419,6 +530,7 @@ static void drawOfflineMark(uint32_t now) {
   fb.fillRect(px + 9, 223, 4, 2, c); fb.fillRect(px + 9, 229, 4, 2, c);  // prongs
   fb.fillRoundRect(220, 219, 4, 16, 1, c);            // socket
 }
+#endif
 
 // ---------- corner extras ----------
 // Small marks drawn over the animation so nothing is hidden when several sessions are busy:
@@ -426,6 +538,7 @@ static void drawOfflineMark(uint32_t now) {
 //   top-left     amber dots, one per session waiting on you (when more than he can show)
 //   top-right    a twinkling sparkle: something finished that you haven't looked at yet
 static uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) { return lgfx::color565(r, g, b); }
+#ifndef BOARD_ESP32_32E
 static bool overlayVisible() {
   if (offlineMark(millis())) return true;
   const String& m = A.moodName[target];
@@ -457,9 +570,107 @@ static void drawOverlay(uint32_t now) {
     }
   }
 }
+#endif
+
+#ifdef BOARD_ESP32_32E
+// Native text below the art, composed off-screen without erasing live text.
+// Odd tuning rotations get a right-hand band so live experiments remain safe.
+struct BandLayout {
+  int x, y, w, h;
+  int countX[3], countY[3];
+  int offlineX, offlineY, tapX, tapY;
+};
+static BandLayout bandLayout(int width, int height) {
+  if (width < height) return {0, 240, width, height - 240,
+    {12, 92, 172}, {252, 252, 252}, 12, 300, 216, 300};
+  return {240, 0, width - 240, height,
+    {250, 250, 250}, {12, 68, 124}, 248, 176, 280, 216};
+}
+static PanelSettings panelSettings = BOARD_PANEL_DEFAULTS;
+constexpr uint32_t TOUCH_FEEDBACK_MS = 450;
+static uint32_t touchFeedbackAt = 0;
+static bool touchFeedback = false;
+struct BandContent {
+  int counts[3];
+  bool offline, tap;
+  bool operator==(const BandContent& b) const {
+    return counts[0] == b.counts[0] && counts[1] == b.counts[1] && counts[2] == b.counts[2]
+           && offline == b.offline && tap == b.tap;
+  }
+};
+static void drawBand(uint32_t now, bool force = false) {
+  static bool valid = false, allocationFailed = false;
+  static BandContent previous{};
+  if (touchFeedback && now - touchFeedbackAt >= TOUCH_FEEDBACK_MS) touchFeedback = false;
+  BandContent content = {{min(ovWorking, 1000), min(ovWaiting, 1000), min(ovUnseen, 1000)},
+                         offlineMark(now), touchFeedback};
+  BandLayout b = bandLayout(tft.width(), tft.height());
+  bool resized = bandFb.width() != b.w || bandFb.height() != b.h;
+  if (resized) {
+    if (allocationFailed && !force) return;
+    bandFb.setColorDepth(16); bandFb.setPsram(false);
+    allocationFailed = bandFb.createSprite(b.w, b.h) == nullptr;
+    if (allocationFailed) { Serial.println("err status framebuffer allocation failed"); return; }
+  }
+  if (!force && !resized && valid && content == previous) return;
+  bandFb.fillScreen(TFT_BLACK);
+  uint16_t rule = rgb(45, 42, 38), cream = rgb(255, 241, 220);
+  if (b.y) bandFb.drawFastHLine(0, 0, b.w, rule);
+  else bandFb.drawFastVLine(0, 0, b.h, rule);
+  bandFb.setTextDatum(top_left); bandFb.setTextSize(1);
+  const char* labels[] = {"WORK", "WAIT", "DONE"};
+  uint16_t colours[] = {cream, rgb(255, 181, 71), rgb(200, 255, 210)};
+  for (int i = 0; i < 3; ++i) {
+    int x = b.countX[i] - b.x, y = b.countY[i] - b.y;
+    bandFb.setTextColor(colours[i]); bandFb.setTextSize(1);
+    bandFb.drawString(labels[i], x, y);
+    bandFb.setTextSize(2);
+    if (content.counts[i] > 999) bandFb.drawString("999+", x, y + 14);
+    else bandFb.drawNumber(content.counts[i], x, y + 14);
+  }
+  bandFb.setTextSize(1); bandFb.setTextColor(cream);
+  if (content.offline) {
+    int x = b.offlineX - b.x, y = b.offlineY - b.y;
+    bandFb.drawString("OFF", x, y - 3);
+    bandFb.drawRect(x + 30, y - 6, 9, 12, cream);
+    bandFb.drawFastHLine(x + 24, y - 1, 6, cream);
+    bandFb.drawFastHLine(x + 39, y - 4, 4, cream);
+    bandFb.drawFastHLine(x + 39, y + 3, 4, cream);
+  }
+  if (content.tap) {
+    // Raw touch XY is intentionally uncalibrated. A fixed TAP ring acknowledges
+    // every accepted press immediately, even while art is between gag frames.
+    int x = b.tapX - b.x, y = b.tapY - b.y;
+    bandFb.drawString("TAP", x - (b.y ? 44 : 8), y - (b.y ? 3 : 30));
+    bandFb.drawCircle(x, y, 8, cream);
+    bandFb.drawCircle(x, y, 12, rgb(255, 122, 69));
+  }
+  bandFb.pushSprite(b.x, b.y);
+  previous = content; valid = true;
+}
+static void pushFrame() {
+  // Explicit integer pixel duplication: no interpolation of the magenta marker.
+  const uint16_t* src = static_cast<const uint16_t*>(fb.getBuffer());
+  static uint16_t rows[240 * 2];
+  tft.startWrite();
+  for (int y = 0; y < 120; ++y) {
+    for (int x = 0; x < 120; ++x) rows[2*x] = rows[2*x+1] = src[y*120+x];
+    memcpy(rows + 240, rows, 240 * sizeof(uint16_t));
+    tft.pushImage(0, y * 2, 240, 2, rows);
+  }
+  tft.endWrite();
+}
+#endif
+
+static void drawRecoveryMessage() {
+  tft.setTextColor(lgfx::color565(255, 241, 220)); tft.setTextDatum(middle_center);
+  tft.setTextSize(1);
+  tft.drawString("no drawings yet", 120, 104); tft.drawString(ART_RECOVERY_COMMAND, 120, 124);
+}
 
 // ---------- serial ----------
 static void reply() {
+  if (!A.ok) { say("err lump art missing or bad"); return; }
   say("ok mode=%s target=%s playing=%s(%s) fps=%.1f frames=%u seqs=%u",
     demo ? "demo" : offline ? "offline" : "direct", A.moodName[target].c_str(), A.name[curSeq].c_str(),
     A.kind[curSeq] == LOOP ? "loop" : A.kind[curSeq] == TRANS ? "transition" : "event", fps, A.nFrames, A.nSeqs);
@@ -479,6 +690,7 @@ static void handleLine(String ln, bool fromNet = false) {
   String arg = ln.substring(1); arg.trim(); arg.toLowerCase();
   heardFromHost();
   if (cmd == 'h') { long s = arg.toInt(); if (s >= 0 && s < 86400) { clockBase = s; clockAt = millis(); } return; }
+  if (!A.ok && (cmd == 's' || cmd == 'e' || cmd == 'p')) { say("err lump art missing or bad"); return; }
   if (cmd == 's') {
     if (arg == "demo" || arg == "cycle") { demo = true; demoNext = 0; return reply(); }
     int m = moodIndex(arg);
@@ -500,12 +712,32 @@ static void handleLine(String ln, bool fromNet = false) {
   if (cmd == 'o') {
     int w = 0, a = 0, u = 0;
     sscanf(arg.c_str(), "%d %d %d", &w, &a, &u);
-    ovWorking = max(0, w); ovWaiting = max(0, a); ovUnseen = max(0, u); lastFrame = -1;
+    ovWorking = max(0, w); ovWaiting = max(0, a); ovUnseen = max(0, u);
+#ifndef BOARD_ESP32_32E
+    lastFrame = -1; // S3 extras are composed over art; 32E counters use the band
+#endif
     say("ok overlay working=%d waiting=%d unseen=%d", ovWorking, ovWaiting, ovUnseen);
     return;
   }
+#ifdef BOARD_ESP32_32E
+  if (cmd == 'P') {
+    if (arg.length()) {
+      PanelSettings next;
+      if (!parsePanelSettings(arg.c_str(), next)) return say("err panel P <invert 0|1> <bgr 0|1> <rotation 0..7>");
+      panelSettings = next; tft.tunePanel(next);
+      lastFrame = -1; drawBand(millis(), true);
+      if (!A.ok) drawRecoveryMessage(); // tuning clears all GRAM; loop cannot restore invalid art
+    }
+    say("ok panel invert=%u bgr=%u rotation=%u width=%d height=%d", unsigned(panelSettings.invert),
+        unsigned(panelSettings.bgr), unsigned(panelSettings.rotation), int(tft.width()), int(tft.height()));
+    return;
+  }
+  if (cmd == 'i') { say("ok touch=xpt2046 pressure=%u peak=%u raw=%ld,%ld irq=%d taps=%lu threshold=%u", touchPressure, touchPeak, long(touchX), long(touchY), digitalRead(PIN_TOUCH_IRQ), (unsigned long)tapCount, tapThreshold); touchPeak = touchPressure; return; }
+  if (cmd == 'T') { int t = arg.toInt(); if (t < 1 || t > 4095) return say("err touch threshold 1..4095"); tapThreshold = t; say("ok threshold=%u pressure", tapThreshold); return; }
+#else
   if (cmd == 'i') { say("ok imu=%s peak=%.2fg taps=%lu threshold=%.2fg", imuAddr ? "on" : "missing", (float)peakJolt, (unsigned long)tapCount, (float)tapThreshold); return; }
   if (cmd == 'T') { float t = arg.toFloat(); if (t > 0.05f && t < 4) tapThreshold = t; say("ok threshold=%.2fg", (float)tapThreshold); return; }
+#endif
   if (cmd == 'c') {
     if (arg.startsWith("#")) arg = arg.substring(1);
     if (arg.length() != 6) { say("err bad colour"); return; }
@@ -525,7 +757,9 @@ static void pollSerial() {
 }
 
 // ---------- Wi-Fi ----------
+#ifndef LUMP_NO_OTA
 static void webBegin();                         // below, with the update server
+#endif
 static void wifiBegin() {
   Preferences pr; pr.begin("lump", true);
   wifiSsid = pr.getString("ssid", ""); String pass = pr.getString("pass", "");
@@ -536,9 +770,20 @@ static void wifiBegin() {
   WiFi.begin(wifiSsid.c_str(), pass.c_str());
   if (tzRule.length()) configTzTime(tzRule.c_str(), "pool.ntp.org", "time.apple.com");
   server.begin(); server.setNoDelay(true);
+#ifndef LUMP_NO_OTA
   webBegin();
+#endif
   wifiStarted = true;
   Serial.printf("wifi joining %s\n", wifiSsid.c_str());
+}
+static void pollWifiStart() {
+  static bool attempted = false;
+#ifdef BOARD_ESP32_32E
+  // STA initialization itself can block, even though association/NTP are
+  // asynchronous. Keep it outside the bridge's three-second USB discovery.
+  if (millis() < 5000) return;
+#endif
+  if (!attempted) { attempted = true; wifiBegin(); }
 }
 // "w <ssid>\t<password>\t<token>\t<tz>" saves and restarts; "w" alone forgets
 static void setWifi(String a) {
@@ -583,6 +828,7 @@ static void pollNet() {
   }
 }
 
+#ifndef LUMP_NO_OTA
 // ---------- updates over Wi-Fi ----------
 static WebServer web(80);
 static uint32_t restartAt = 0;
@@ -684,37 +930,86 @@ static void webBegin() {
   web.on("/update/art", HTTP_POST, onUpdateDone, onArtData);
   web.begin();
 }
+#endif
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_BL, OUTPUT); analogWrite(PIN_BL, BL_DAY);
+  pinMode(PIN_BL, OUTPUT);
+#ifdef BOARD_ESP32_32E
+  analogWrite(PIN_BL, 0); // hide init, inversion, stale GRAM and diagnostic patterns
+  pinMode(PIN_TOUCH_CS, OUTPUT); digitalWrite(PIN_TOUCH_CS, HIGH);
+  pinMode(PIN_TOUCH_IRQ, INPUT);
+  probePanelGPIO();
+  tft.init(); tft.tunePanel(BOARD_PANEL_DEFAULTS);
+  tft.panelEvidence();
+  drawBand(millis(), true);
+#else
+  analogWrite(PIN_BL, BL_DAY);
   tft.init(); tft.setRotation(PRISM_MIRROR ? 4 : 0); tft.fillScreen(TFT_BLACK);
+#endif
   fb.setColorDepth(16); fb.setPsram(false);
-  if (!fb.createSprite(240, 240)) { fb.setPsram(true); fb.createSprite(240, 240); }
+#ifdef BOARD_ESP32_32E
+  bool haveBuffer = fb.createSprite(120, 120) != nullptr;
+#else
+  bool haveBuffer = fb.createSprite(240, 240) != nullptr;
+  if (!haveBuffer) { fb.setPsram(true); haveBuffer = fb.createSprite(240, 240) != nullptr; }
+#endif
+  if (!haveBuffer) { Serial.println("err framebuffer allocation failed"); analogWrite(PIN_BL, BL_DAY); return; }
+#ifdef BOARD_ESP32_32E
+  fb.fillScreen(TFT_BLACK); fb.drawPixel(0, 0, TFT_RED); fb.drawPixel(1, 0, TFT_GREEN);
+  fb.drawPixel(0, 1, TFT_BLUE); fb.drawPixel(1, 1, TFT_WHITE);
+  pushFrame();
+  const uint16_t expected[] = {TFT_RED, TFT_GREEN, TFT_BLUE, TFT_WHITE};
+  unsigned matched = 0;
+  for (int y = 0; y < 4; ++y) for (int x = 0; x < 4; ++x) {
+    uint16_t got = tft.readPixel(x, y), want = expected[(y / 2) * 2 + x / 2];
+    if (got == want) ++matched;
+    else Serial.printf("scaled pixel %d,%d: %04X expected %04X\n", x, y, unsigned(got), unsigned(want));
+  }
+  Serial.printf("scaled sprite readback %s (%u/16 pixels)\n", matched == 16 ? "PASS" : "FAIL", matched);
+#endif
   if (!mapArt() || !parseAnim()) {
     A.ok = false;
-    Serial.println("err lump art missing or bad (send it: tools/ota.py --art)");
-    tft.setTextColor(lgfx::color565(255, 241, 220)); tft.setTextDatum(middle_center);
-    tft.drawString("no drawings yet", 120, 104); tft.drawString("tools/ota.py --art", 120, 124);
-    wifiBegin();                                   // still reachable, so the art can be sent
+    Serial.printf("err lump art missing or bad (send it: %s)\n", ART_RECOVERY_COMMAND);
+    drawRecoveryMessage();
+    analogWrite(PIN_BL, BL_DAY);
     return;
   }
   Serial.printf("desk-buddy lump ready: %u moods, %u sequences, %u frames\n", A.nMoods, A.nSeqs, A.nFrames);
   randomSeed(esp_random());
+#ifdef BOARD_ESP32_32E
+  Serial.printf("touch XPT2046 ready: CS=%d IRQ=%d threshold=%u; OTA disabled\n", PIN_TOUCH_CS, PIN_TOUCH_IRQ, tapThreshold);
+#else
   if (imuInit()) { xTaskCreatePinnedToCore(imuTask, "imu", 4096, nullptr, 2, nullptr, 0); Serial.println("imu ready"); }
   else Serial.println("imu not found");
+#endif
   curMood = target = 0; startSeq(A.loopOf[0]); loopSince = millis();
-  wifiBegin();
+#ifdef BOARD_ESP32_32E
+  // Replace the scaled-pixel diagnostic with real art before lighting up.
+  lastFrame = rd16(A.seq[curSeq]); decodeFrame(lastFrame); pushFrame();
+  analogWrite(PIN_BL, BL_DAY);
+#endif
+  Serial.printf("heap free=%u largest=%u psram=%u\n", unsigned(ESP.getFreeHeap()), unsigned(ESP.getMaxAllocHeap()), unsigned(ESP.getPsramSize()));
 }
 
 void loop() {
   pollSerial();
+  pollWifiStart();                               // also runs when art/buffer setup failed
   pollNet();
+#ifndef LUMP_NO_OTA
   if (wifiStarted) web.handleClient();
   if (restartAt && millis() > restartAt) ESP.restart();
+#endif
   if (!A.ok) { delay(20); return; }
+#ifdef BOARD_ESP32_32E
+  pollTouch(millis());
+#endif
   if (tapPending) {
     tapPending = false;
+#ifdef BOARD_ESP32_32E
+    touchFeedback = true; touchFeedbackAt = millis();
+    drawBand(touchFeedbackAt);                      // visible before starting the gag
+#endif
     say("tap");                                    // the bridge decides what a tap means for Claude
     playEvent("tap");                              // he reacts in every mood (the bridge may then move him on)
   }
@@ -723,6 +1018,9 @@ void loop() {
   runOffline(now);
   autoBehaviour(now);
   backlight(now);
+#ifdef BOARD_ESP32_32E
+  drawBand(now);
+#endif
 
   int32_t age = int32_t(now - seqStart);         // signed: something started after 'now' is age 0, not 49 days
   uint32_t tick = age > 0 ? uint32_t(age) * A.fps / 1000 : 0;
@@ -738,12 +1036,20 @@ void loop() {
   }
   static uint32_t lastOverlayTick = 0;
   uint32_t overlayTick = now / 100;              // corner extras animate at ~10 fps
+#ifdef BOARD_ESP32_32E
+  bool ov = false; // the separate status band never needs an art redraw
+#else
   bool ov = overlayVisible();
+#endif
   if (idx != lastFrame || (ov && overlayTick != lastOverlayTick)) {
     lastOverlayTick = overlayTick;
     decodeFrame(idx);
+#ifdef BOARD_ESP32_32E
+    pushFrame();
+#else
     if (ov) drawOverlay(now);
     fb.pushSprite(0, 0);
+#endif
     lastFrame = idx;
     static uint32_t t0 = now; static int n = 0;
     if (++n, now - t0 >= 2000) { fps = n * 1000.f / (now - t0); n = 0; t0 = now; }

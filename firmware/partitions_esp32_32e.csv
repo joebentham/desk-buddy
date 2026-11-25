@@ -1,0 +1,7 @@
+# Single program slot: USB updates only. Preserve the 0x9000 NVS region.
+# Name,    Type, SubType,  Offset,   Size
+nvs,       data, nvs,      0x9000,   0x5000
+phy_init,  data, phy,      0xe000,   0x1000
+app0,      app,  factory,  0x10000,  0x170000
+lump,      data, 0x40,     0x180000, 0x270000
+coredump,  data, coredump, 0x3f0000, 0x10000
