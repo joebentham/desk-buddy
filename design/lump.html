@@ -1103,6 +1103,39 @@ function at(m, tick) { // which exposure-sheet entry is showing on this frame
 let tint = '#FF7A45', lineMode = 'glow', workProp = 'lap3d-60', smudgeCv = null;
 const ink = () => lineMode === 'glow' ? '#FFF1DC' : '#17161A';
 
+/* ---------- the menu bar version (tools/lumpbar/bake.py) ----------
+   At 20-30 pt his 4-unit outline lands under a pixel and his face is a few dots, so the Mac app gets
+   its own take on every mood: a heavier, steadier line with the colour tucked under it, the face
+   zoomed up, fussy prop detail dropped and effects kept close to him.
+   render(..., { mini: { line } }) turns it on; line = how many times heavier the body outline gets
+   (the baker picks it so the outline lands at a set number of screen pixels). */
+const MINI = { face: 1.45, faceLine: 1.1, propLine: 0.75, fxLine: 1.4, boil: 0.3 };
+let mini = null, part = 'body';                 // part: which bit is drawing, for its line weight
+function miniCtx(c) {
+  const weight = { body: 1, face: MINI.faceLine, prop: MINI.propLine, fx: MINI.fxLine };
+  return new Proxy(c, {
+    get(t, p) { const v = t[p]; return typeof v === 'function' ? v.bind(t) : v; },
+    set(t, p, v) { if (p === 'lineWidth') v *= mini.line * weight[part]; t[p] = v; return true; },
+  });
+}
+function zoomFace(face, F) {                    // the whole face scaled up about its middle
+  const pts = [];
+  face.forEach(mk => { if (mk[0] === 'stroke' || mk[0] === 'mouth') pts.push(...mk[1]); else if (mk[0] !== 'blush') pts.push([mk[1], mk[2]]); });
+  if (!pts.length) return face;
+  const cx = pts.reduce((a, p) => a + p[0], 0) / pts.length, cy = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+  const P = ([x, y]) => [cx + (x - cx) * F, cy + (y - cy) * F];
+  return face.map(mk => {
+    switch (mk[0]) {
+      case 'dot': case 'shine': case 'spiral': { const q = P([mk[1], mk[2]]); return [mk[0], q[0], q[1], mk[3] * F]; }
+      case 'oval': case 'blush': case 'lips': { const q = P([mk[1], mk[2]]); return [mk[0], q[0], q[1], mk[3] * F, mk[4] * F, mk[5]]; }
+      case 'teeth': { const q = P([mk[1], mk[2]]); return ['teeth', q[0], q[1], mk[3] * F, mk[4] * F]; }
+      case 'stroke': return ['stroke', mk[1].map(P), mk[2]];
+      case 'mouth': { const t = mk[2] && [...P([mk[2][0], mk[2][1]]), mk[2][2] * F, mk[2][3] * F]; return t ? ['mouth', mk[1].map(P), t] : ['mouth', mk[1].map(P)]; }
+    }
+    return mk;
+  });
+}
+
 // Move/scale/rotate a drawing: k scales about (ox, oy), rot turns about it, then shift by (dx, dy).
 // o.face replaces the face (given in the original drawing's coordinates); o.extra adds props in screen coordinates.
 // where a point in a drawing ends up after xf(d, o)
@@ -1183,7 +1216,7 @@ function accordion(h, w, folds, mood) {
   return { body, corners, pleats, panels, face, curl: [[cx, top + 1], [cx - 6, top - 10], [cx - 2, top - 18], [cx + 6, top - 15], [cx + 3, top - 9]],
            shadow: [128, w / 2 + 8], fx: [cx, top - 4], fxm: 'notes' };
 }
-function boil(pts, seed, amt) { return pts.map((p, i) => [p[0] + (hash(seed * 97.1 + i * 7.13) - 0.5) * amt, p[1] + (hash(seed * 31.7 + i * 3.31) - 0.5) * amt]); }
+function boil(pts, seed, amt) { if (mini) amt *= MINI.boil; return pts.map((p, i) => [p[0] + (hash(seed * 97.1 + i * 7.13) - 0.5) * amt, p[1] + (hash(seed * 31.7 + i * 3.31) - 0.5) * amt]); }
 function closedPath(c, P, corners) {           // corners: indices drawn as sharp points
   const n = P.length; c.beginPath(); c.moveTo(P[0][0], P[0][1]);
   const sharp = i => corners && corners.includes(i % n);
@@ -1204,6 +1237,7 @@ function openPath(c, P) {
 }
 function inkStroke(c, w) { // a heavier edge on the lower right, like a brush line
   c.lineWidth = w; c.stroke();
+  if (mini) return;                             // too small for the brush edge: it just smudges
   c.save(); c.translate(0.9, 1.1); c.lineWidth = w * 0.7; c.stroke(); c.restore();
 }
 function zDoodle(c, x, y, s, seed) {
@@ -1230,11 +1264,12 @@ function drawFX(c, m, d, tick, seed) {
     for (let k = 0; k < n; k++) {
       const p = ((step + k * 6) % period) / period; // moves up in held steps, like redrawn frames
       c.globalAlpha = Math.sin(p * Math.PI);
-      zDoodle(c, fx + p * 18 + k * 2, fy - p * 46, 7 + p * 6, seed + k);
+      if (mini) zDoodle(c, fx + 2 + p * 12 + k * 2, fy - 2 - p * 24, 8 + p * 4, seed + k);   // a shorter drift, so they stay in his slot
+      else zDoodle(c, fx + p * 18 + k * 2, fy - p * 46, 7 + p * 6, seed + k);
     }
     c.globalAlpha = 1;
   }
-  if (m === 'night' || m === 'nightsky') {               // nightsky: the moon and stars without the snoring
+  if ((m === 'night' || m === 'nightsky') && !mini) {    // nightsky: the moon and stars without the snoring (too far off for the menu bar)
     c.lineWidth = 2.4;
     const M = boil([[48, 40], [40, 52], [44, 66], [58, 72], [50, 62], [48, 50]], seed + 40, 0.8);
     closedPath(c, M); c.stroke();
@@ -1263,7 +1298,8 @@ function drawFX(c, m, d, tick, seed) {
   }
   if (m === 'done') {
     const spots = [[-58, 10, 8], [62, 4, 10], [-44, -24, 6], [52, -30, 7], [-70, 60, 6], [74, 56, 8]];
-    spots.forEach(([dx, dy, s], k) => { if ((step + k) % 3 !== 0) sparkle(c, fx + dx, fy + dy + 30, s, seed + k * 3); });
+    const pull = mini ? 0.72 : 1;                          // in the menu bar, keep them close
+    spots.forEach(([dx, dy, s], k) => { if ((step + k) % 3 !== 0) sparkle(c, fx + dx * pull, fy + dy * pull + 30, s, seed + k * 3); });
   }
   if (m === 'oops') { // dizzy stars circling his head
     for (let k = 0; k < 3; k++) { const a = (step % 3) * 0.7 + k * 2.09; sparkle(c, fx + Math.cos(a) * 30, fy + Math.sin(a) * 8, 5 + (Math.sin(a) > 0 ? 2 : 0), seed + k); }
@@ -1635,7 +1671,7 @@ function laptop3D(c, seed, tick, turn) {
   const s0 = S('l3'), s1 = S('l0');
   c.save(); c.strokeStyle = lineMode === 'glow' ? '#FFF1DC' : '#7FB8E6'; c.lineWidth = 1.2; c.setLineDash([2, 3]);
   c.globalAlpha = 0.45 + 0.2 * Math.sin(tick * 0.9);
-  for (const t of [0.3, 0.6]) {                                 // a couple of soft light rays toward his face
+  if (!mini) for (const t of [0.3, 0.6]) {                                 // a couple of soft light rays toward his face
     const a = [s0[0] + (s1[0] - s0[0]) * t, s0[1] + (s1[1] - s0[1]) * t];
     openPath(c, boil([[a[0] - 4, a[1]], [a[0] - 16, a[1] - 6 + t * 6]], seed + 40 + t * 10, 0.6)); c.stroke();
   }
@@ -1646,7 +1682,7 @@ function laptop3D(c, seed, tick, turn) {
     quad(c, pts);
     c.fillStyle = f.kind === 'screen' ? glass : paper; c.fill();
     c.strokeStyle = L; c.lineWidth = f.kind === 'side' ? 1.8 : 2.2; c.stroke();
-    if (f.kind === 'deck') {                                   // keyboard rows + trackpad
+    if (f.kind === 'deck' && !mini) {                          // keyboard rows + trackpad (just noise in the menu bar)
       c.save(); c.lineWidth = 1.2; c.setLineDash([1.6, 2.4]);
       for (const v of [0.62, 0.74, 0.86]) { const a = bil(f, 0.12, v), b = bil(f, 0.88, v); c.beginPath(); c.moveTo(...a); c.lineTo(...b); c.stroke(); }
       c.setLineDash([]); quad(c, [bil(f, 0.36, 0.12), bil(f, 0.64, 0.12), bil(f, 0.64, 0.38), bil(f, 0.36, 0.38)]); c.stroke(); c.restore();
@@ -1654,7 +1690,7 @@ function laptop3D(c, seed, tick, turn) {
     if (f.kind === 'screen') {                                 // code scrolling on the screen
       const step = Math.floor(tick / 6);
       c.save(); c.strokeStyle = glow; c.lineWidth = 1.3;
-      for (let r = 0; r < 4; r++) { const len = 0.3 + hash((step + r) * 3.1) * 0.55, v = 0.78 - r * 0.15, u0 = 0.12 + (hash((step + r) * 7.7) > 0.6 ? 0.08 : 0);
+      for (let r = 0; r < (mini ? 2 : 4); r++) { const len = 0.3 + hash((step + r) * 3.1) * 0.55, v = 0.78 - r * 0.15, u0 = 0.12 + (hash((step + r) * 7.7) > 0.6 ? 0.08 : 0);
         const a = bil(f, u0, v), b = bil(f, Math.min(0.9, u0 + len), v); c.beginPath(); c.moveTo(...a); c.lineTo(...b); c.stroke(); }
       if (Math.floor(tick / 8) % 2) { const a = bil(f, 0.12, 0.16), b = bil(f, 0.12, 0.24); c.lineWidth = 1.8; c.beginPath(); c.moveTo(...a); c.lineTo(...b); c.stroke(); }
       c.restore();
@@ -2091,6 +2127,7 @@ function drawBoom(c, d, seed) {
 }
 
 function drawFace(c, d, seed) {
+  if (mini) d = { ...d, face: zoomFace(d.face, MINI.face) };
   const FC = d.inverse ? '#FFF1DC' : '#0B0E14';
   c.fillStyle = FC; c.strokeStyle = FC; c.lineCap = 'round'; c.lineJoin = 'round';
   d.face.forEach((mk, k) => {
@@ -2132,16 +2169,18 @@ function drawFace(c, d, seed) {
 function mixHex(a, b, k) { const p = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)); const A = p(a), B = p(b); return '#' + A.map((v, i) => Math.round(v + (B[i] - v) * k).toString(16).padStart(2, '0')).join(''); }
 
 function render(c, m, id, tick, opts = {}) {
+  if (opts.mini) { mini = opts.mini; part = 'body'; try { return render(miniCtx(c), m, id, tick, { ...opts, mini: null }); } finally { mini = null; } }
+  const reg = mini ? 0 : 1;                     // off-register fill (none in the menu bar: it reads as blur)
   const d = D[id], seed = opts.still ? 1 : (Math.floor(tick / 2) % 3) + idSeed(id);
   c.setTransform(1, 0, 0, 1, 0, 0);
   c.fillStyle = lineMode === 'paper' ? '#F4EFE6' : '#000'; c.fillRect(0, 0, 240, 240);
   // shadow
   c.fillStyle = lineMode === 'paper' ? '#CFC8BC' : 'rgba(255,241,220,.10)';
   c.beginPath(); c.ellipse(d.shadow[0] + 4, 203, d.shadow[1], 6, 0, 0, Math.PI * 2); c.fill();
-  drawBackProps(c, d, seed, tick);
+  part = 'prop'; drawBackProps(c, d, seed, tick); part = 'body';
   const body = boil(d.body, seed, 2.2);
   // off-register fill
-  c.save(); c.translate(4, 2.5); closedPath(c, boil(d.body, seed + 50, 2.2), d.corners); c.fillStyle = d.soot ? '#3B342E' : d.inverse ? '#000' : tint; c.fill(); c.restore();
+  c.save(); c.translate(4 * reg, 2.5 * reg); closedPath(c, boil(d.body, seed + 50, 2.2), d.corners); c.fillStyle = d.soot ? '#3B342E' : d.inverse ? '#000' : tint; c.fill(); c.restore();
   if (d.press) {                                // squashed flat against the glass
     const [px, py, rx, ry] = d.press;
     c.save(); c.beginPath(); c.ellipse(px + 3, py + 2, rx, ry, 0, 0, Math.PI * 2); c.fillStyle = 'rgba(255,241,220,.2)'; c.fill();
@@ -2149,7 +2188,7 @@ function render(c, m, id, tick, opts = {}) {
     c.restore();
   }
   if (d.panels) {                               // accordion folds: shade the undersides
-    c.save(); c.translate(4, 2.5); c.fillStyle = 'rgba(0,0,0,.32)';
+    c.save(); c.translate(4 * reg, 2.5 * reg); c.fillStyle = 'rgba(0,0,0,.32)';
     d.panels.forEach((P, k) => { const B = boil(P, seed + 80 + k, 1); c.beginPath(); B.forEach((q, i) => i ? c.lineTo(q[0], q[1]) : c.moveTo(q[0], q[1])); c.closePath(); c.fill(); });
     c.restore();
   }
@@ -2167,10 +2206,11 @@ function render(c, m, id, tick, opts = {}) {
   if (d.pleats) { c.lineWidth = 2.6; d.pleats.forEach((P, k) => { openPath(c, boil(P, seed + 60 + k, 1)); c.stroke(); }); }
   if (d.blanket !== undefined) drawBlanket(c, d, seed);
   if (d.blanketFly) drawBlanketFly(c, d, seed);
-  drawFace(c, d, seed);
-  drawFrontProps(c, d, seed, tick);
-  if (!opts.noFX) drawFX(c, m, d, tick, seed);
+  part = 'face'; drawFace(c, d, seed);
+  part = 'prop'; drawFrontProps(c, d, seed, tick);
+  part = 'fx'; if (!opts.noFX) drawFX(c, m, d, tick, seed);
   if (d.boom) drawBoom(c, d, seed);
+  part = 'body';
   // night: the device dims its backlight instead, so baked frames skip this
   if (m === 'night' && opts.dim !== false && lineMode === 'glow') { c.fillStyle = 'rgba(0,0,0,.45)'; c.fillRect(0, 0, 240, 240); }
 }

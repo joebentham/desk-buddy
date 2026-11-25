@@ -11,7 +11,8 @@
 // Click him to open what he's on about (the bridge picks it: GET /open): the thread that needs you,
 // the one that's working, what just finished, a VIP's Slack DM, or the meeting that's starting.
 //
-// Mood and colour come from the bridge (GET 127.0.0.1:47823/status, once a second).
+// Mood and colour come from the bridge (GET 127.0.0.1:47823/status, once a second), and so do one-off
+// animations it plays on the desk Lump ("event"): any it has drawings for, like the Slack paper plane, play once.
 // Frames come from tools/lumpbar/bake.py (copied into the app's Resources/frames).
 // Build and launch: zsh tools/lumpbar/build.sh
 
@@ -57,8 +58,8 @@ final class Strip {
         }
         return ok ? (px, w, h) : nil
     }
-    /// Every frame of the strip with the body painted `rgb`.
-    func painted(_ rgb: (Int, Int, Int), size: Int) -> [CGImage] {
+    /// Every frame of the strip with the body painted `rgb` (frames are `frameWidth` px wide, side by side).
+    func painted(_ rgb: (Int, Int, Int), frameWidth: Int) -> [CGImage] {
         var out = [UInt8](repeating: 0, count: k.count)
         let t = [rgb.0, rgb.1, rgb.2]
         for i in stride(from: 0, to: k.count, by: 4) {
@@ -70,13 +71,14 @@ final class Strip {
                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
                                  provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent) else { return [] }
-        return (0..<(width / size)).compactMap { full.cropping(to: CGRect(x: $0 * size, y: 0, width: size, height: size)) }
+        return (0..<(width / frameWidth)).compactMap { full.cropping(to: CGRect(x: $0 * frameWidth, y: 0, width: frameWidth, height: height)) }
     }
 }
 
 final class Sprites {
     struct Mood: Decodable { let frames: Int; let ticks: [Int] }
-    struct Manifest: Decodable { let size: Int; let fps: Int; let moods: [String: Mood] }
+    /// sizes: "wing" (beside the notch) and "item" (a menu bar item), each [width, height] in px, drawn for that size.
+    struct Manifest: Decodable { let fps: Int; let sizes: [String: [Int]]; let moods: [String: Mood]; let events: [String: Mood]? }
     let manifest: Manifest, dir: URL
     private var strips: [String: Strip] = [:]
     private var painted: [String: [CGImage]] = [:]
@@ -84,19 +86,22 @@ final class Sprites {
     init?(dir: URL) {
         guard let data = try? Data(contentsOf: dir.appendingPathComponent("manifest.json")),
               let m = try? JSONDecoder().decode(Manifest.self, from: data) else { return nil }
+        guard m.sizes["wing"]?.count == 2, m.sizes["item"]?.count == 2 else { return nil }
         manifest = m; self.dir = dir
     }
-    func ticks(_ mood: String) -> [Int] { manifest.moods[mood]?.ticks ?? [] }
-    func frames(_ mood: String, ink: String, colour: String) -> [CGImage] {
-        let key = "\(mood)-\(ink)-\(colour)"
+    /// His slot's width over its height (the same at every size).
+    var aspect: CGFloat { let s = manifest.sizes["wing"]!; return CGFloat(s[0]) / CGFloat(s[1]) }
+    func ticks(_ mood: String) -> [Int] { manifest.moods[mood]?.ticks ?? manifest.events?[mood]?.ticks ?? [] }
+    func frames(_ mood: String, size: String, ink: String, colour: String) -> [CGImage] {
+        let key = "\(mood)-\(size)-\(ink)-\(colour)"
         if let f = painted[key] { return f }
-        let sk = "\(mood)-\(ink)"
+        let sk = "\(mood)-\(size)-\(ink)"
         if strips[sk] == nil {
             strips[sk] = Strip(k: dir.appendingPathComponent("\(sk)-k.png"), w: dir.appendingPathComponent("\(sk)-w.png"))
         }
         guard let strip = strips[sk] else { return [] }
         if painted.count > 24 { painted.removeAll() }      // the meeting countdown slides the colour: don't hoard
-        let f = strip.painted(rgb(colour), size: manifest.size)
+        let f = strip.painted(rgb(colour), frameWidth: manifest.sizes[size]?[0] ?? strip.height)
         painted[key] = f
         return f
     }
@@ -128,10 +133,10 @@ final class WingView: NSView {
             NSColor.black.setFill(); p.fill()
         }
         guard let img = image, let ctx = NSGraphicsContext.current?.cgContext else { return }
-        let side = b.height - 2, x = overlap + (b.width - overlap - side) / 2
+        let h = b.height - 2, w = h * CGFloat(img.width) / CGFloat(img.height), x = overlap + (b.width - overlap - w) / 2
         ctx.interpolationQuality = .high
         ctx.setAlpha(dim)
-        ctx.draw(img, in: CGRect(x: x, y: 1, width: side, height: side))
+        ctx.draw(img, in: CGRect(x: x, y: 1, width: w, height: h))
     }
     override func rightMouseDown(with event: NSEvent) { onRightClick?(event) }
     override func mouseDown(with event: NSEvent) {
@@ -144,6 +149,9 @@ final class WingView: NSView {
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var sprites: Sprites!
     var mood = "idle", colour = DEFAULT_COLOUR, online = false
+    /// A one-off animation playing once over his mood (e.g. tap_plane for a Slack DM), and the bridge's
+    /// count of the last one it reported (-1 until the first poll, so an old one isn't replayed at launch).
+    var playing: String?, lastEventN = -1
     var deviceSeen = Date.distantPast, atDesk = false, placed = false
     var tick = 0, shownKey = "", peekUntil = Date.distantPast, menuWhenPlaced = false
     var wing: NSPanel?, wingView: WingView?
@@ -261,7 +269,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Tell the Matchday island how much room he needs beside it (0 = not in the notch).
     func announce(force: Bool = false) {
-        let width: CGFloat = wing?.isVisible == true ? (notch().map { $0.height + 6 } ?? 0) : 0
+        let width: CGFloat = wing?.isVisible == true ? (notch().map { wingWidth($0.height) } ?? 0) : 0
         if !force && width == announced { return }
         announced = width
         DistributedNotificationCenter.default().postNotificationName(LUMP_WING, object: nil, userInfo: ["width": Double(width)], deliverImmediately: true)
@@ -275,10 +283,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if placed { place() }
     }
 
+    /// His wing beside the notch: his slot (as tall as the menu bar, less a point top and bottom) plus a little room.
+    func wingWidth(_ h: CGFloat) -> CGFloat { ((h - 2) * sprites.aspect + 8).rounded() }
+
     func showWing(_ n: (screen: NSScreen, height: CGFloat, right: CGFloat)) {
         let f = n.screen.frame, h = n.height
         let docked = dockRect != nil
-        let overlap: CGFloat = docked ? 0 : 12, w = h + 6
+        let overlap: CGFloat = docked ? 0 : 12, w = wingWidth(h)
         let frame = dockRect ?? NSRect(x: n.right - overlap, y: f.maxY - h, width: w + overlap, height: h)
         if wing == nil {
             let p = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -305,7 +316,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func showItem() {
         if item == nil {
-            let it = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+            let side = NSStatusBar.system.thickness - 2
+            let it = NSStatusBar.system.statusItem(withLength: (side * sprites.aspect + 6).rounded())
             it.button?.imageScaling = .scaleProportionallyUpOrDown
             it.button?.target = self
             it.button?.action = #selector(itemClicked)
@@ -445,7 +457,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 guard let j = j else { self.online = false; return }
                 self.online = true
-                if let m = j["mood"] as? String, self.sprites.manifest.moods[m] != nil, m != self.mood { self.mood = m; self.tick = 0 }
+                if let m = j["mood"] as? String, self.sprites.manifest.moods[m] != nil, m != self.mood {
+                    self.mood = m; if self.playing == nil { self.tick = 0 }
+                }
+                if let e = j["event"] as? [String: Any], let n = e["n"] as? Int, n != self.lastEventN {
+                    let fresh = (e["age_s"] as? Double ?? 99) < 5
+                    if self.lastEventN >= 0, fresh, let name = e["name"] as? String, self.sprites.manifest.events?[name] != nil {
+                        self.playing = name; self.tick = 0
+                    }
+                    self.lastEventN = n
+                }
                 if let c = j["colour"] as? String, c.count == 6 { self.colour = c.uppercased() }
                 if j["device"] as? Bool == true { self.deviceSeen = Date() }
             }
@@ -453,22 +474,25 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func step() {
-        let ticks = sprites.ticks(mood)
+        var cur = playing ?? mood
+        var ticks = sprites.ticks(cur)
+        if playing != nil, tick >= ticks.count { playing = nil; tick = 0; cur = mood; ticks = sprites.ticks(cur) }   // played once: back to his mood
         guard !ticks.isEmpty else { return }
         let idx = ticks[tick % ticks.count]; tick += 1
         let dark: Bool
         if let b = item?.button { dark = b.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua } else { dark = true }
         let ink = (wing?.isVisible ?? false) || dark ? "glow" : "paper"   // the wing is always black
         let dim: CGFloat = !online ? 0.4 : mood == "night" ? 0.55 : 1     // asleep at night, faded when the bridge is down
-        let key = "\(mood)-\(ink)-\(colour)-\(idx)-\(dim)"
+        let key = "\(cur)-\(wing?.isVisible == true)-\(ink)-\(colour)-\(idx)-\(dim)"
         if key == shownKey { return }
         shownKey = key
-        let frames = sprites.frames(mood, ink: ink, colour: colour)
+        let size = wing?.isVisible == true ? "wing" : "item"
+        let frames = sprites.frames(cur, size: size, ink: ink, colour: colour)
         guard idx < frames.count else { return }
         if let v = wingView, wing?.isVisible == true { v.dim = dim; v.image = frames[idx] }
         if let b = item?.button {
             let side = NSStatusBar.system.thickness - 2
-            let img = NSImage(cgImage: frames[idx], size: NSSize(width: side, height: side))
+            let img = NSImage(cgImage: frames[idx], size: NSSize(width: side * sprites.aspect, height: side))
             b.image = img; b.alphaValue = dim
         }
     }

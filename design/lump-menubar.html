@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lump Menu Bar Styles</title>
+<style>
+  :root { --bg: #F4EFE6; --fg: #17161A; --muted: #6B665E; --card: #FFFFFF; --line: #E3DCCF; --accent: #FF7A45; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #121114; --fg: #F2ECE2; --muted: #9A948A; --card: #1C1B1F; --line: #2C2A30; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 -apple-system, system-ui, sans-serif; padding: 28px 24px 80px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; margin: 36px 0 4px; }
+  p.lede, p.sub { color: var(--muted); margin: 0 0 16px; max-width: 760px; }
+  .moods { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 18px; align-items: center; }
+  .moods button { font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+  .moods button[aria-pressed="true"] { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+  .moods label { margin-left: 8px; color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  .row { display: grid; grid-template-columns: 220px 1fr; gap: 18px; padding: 16px 0; border-top: 1px solid var(--line); align-items: center; }
+  .row .name { font-weight: 600; }
+  .row .note { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .places { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; }
+  .place { display: flex; flex-direction: column; gap: 6px; }
+  .place small { color: var(--muted); font-size: 11px; }
+  /* a slice of a MacBook menu bar: wallpaper, notch, Lump's wing */
+  .bar { position: relative; height: 33px; display: flex; align-items: flex-start; border-radius: 6px; overflow: hidden; }
+  .bar.wall { width: 300px; background: linear-gradient(100deg, #3B4A6B, #6E5A7E 55%, #B0716A); }
+  .bar.wall::before { content: ""; position: absolute; inset: 0; background: rgba(20,20,28,.35); }
+  .notch { position: relative; width: 120px; height: 32px; background: #000; border-radius: 0 0 10px 0; }
+  .wing { position: relative; height: 32px; background: #000; border-radius: 0 0 10px 0; margin-left: -10px; display: flex; align-items: center; justify-content: center; padding-left: 10px; }
+  .menu { width: 260px; height: 33px; display: flex; align-items: center; justify-content: flex-end; gap: 14px; padding: 0 12px; font-size: 13px; font-weight: 500; border-radius: 6px; }
+  .menu.dark { background: linear-gradient(100deg, #2B3550, #4C3F5C 60%, #6B4A4A); color: #F5F5F7; }
+  .menu.light { background: linear-gradient(100deg, #D9DEE8, #E9E1EA 60%, #F1E3DA); color: #1D1D1F; }
+  .menu .glyph { width: 22px; height: 11px; border: 1.5px solid currentColor; border-radius: 3px; position: relative; opacity: .85; }
+  .menu .glyph::after { content: ""; position: absolute; left: 2px; top: 2px; bottom: 2px; width: 60%; background: currentColor; border-radius: 1px; }
+  canvas { display: block; }
+  /* zoomed key frames */
+  .grid { display: grid; grid-template-columns: 220px repeat(var(--n), 1fr); gap: 10px 10px; align-items: center; margin-top: 10px; }
+  .grid .head { color: var(--muted); font-size: 12px; text-align: center; }
+  .grid .vname { font-weight: 600; font-size: 13px; }
+  .cell { background: #000; border-radius: 8px; display: flex; align-items: center; justify-content: center; padding: 8px; }
+  .cell canvas { image-rendering: pixelated; height: 124px; width: auto; }
+  .scroller { overflow-x: auto; padding-bottom: 8px; }
+  .grid { grid-template-columns: 160px repeat(var(--n), max-content); }
+  @media (max-width: 700px) { .row { grid-template-columns: 1fr; } body { padding: 20px 16px 60px; } }
+</style>
+</head>
+<body>
+<h1>Lump at menu bar size</h1>
+<p class="lede">Every drawing here comes from the real <code>lump.html</code> code, rendered at the exact pixels your MacBook uses: the notch wing (31 pt, 62 px) and a menu bar item (20 pt, 40 px). Only the line weight, eyes, wobble and framing change between rows.</p>
+
+<div class="moods" id="moods"></div>
+
+<h2>In place, actual size</h2>
+<p class="sub">Look at these without zooming. That's how they'll read next to the notch.</p>
+<div id="live"></div>
+
+<h2>Key frames, real pixels ×4</h2>
+<p class="sub">The wing-size frame for each mood, blown up with no smoothing so you can see what each pixel is doing.</p>
+<div class="scroller"><div class="grid" id="keys"></div></div>
+
+<iframe id="src" style="position:absolute;left:-9999px;width:240px;height:240px;border:0" aria-hidden="true"></iframe>
+<script>
+const MOODS = [
+  ['idle', 'Dozing'], ['working', 'Working'], ['alert', 'Needs you'], ['done', 'Done'], ['waiting', 'Waiting'],
+  ['longhaul', 'Long haul'], ['letter', 'Slack VIP'], ['meeting', 'Meeting'], ['awake', 'Awake'], ['night', 'Night'],
+];
+const TINT = '#FF7A45';
+// outline: his body line in real pixels at wing size (62 px); smaller slots keep at least minOutline.
+// face: zooms the whole face about its centre. faceLine / propLine / fxLine: extra weight on those lines.
+const VARIANTS = [
+  { id: 'today', name: 'Today', note: 'What the app shows now: the full drawing shrunk to fit his whole loop. His outline lands under 1 px, the face barely registers.',
+    today: true, face: 1, reg: 1, brush: true, boil: 1, pad: 14 },
+  { id: 'felt', name: 'A · Felt-tip', note: 'Keeps the hand-drawn wobble and brushy edge. Outline about 2 px, face 25% bigger, tighter frame.',
+    outline: 2.2, minOutline: 1.6, face: 1.25, faceLine: 1.15, propLine: 0.8, fxLine: 1.25, reg: 0.5, brush: true, boil: 0.7, pad: 8 },
+  { id: 'sticker', name: 'B · Sticker', note: 'Bold, steady 3 px line with the colour tucked under it, face 45% bigger, heavier sparks and Zs, and a thin keyline so he pops on any wallpaper.',
+    outline: 3, minOutline: 2, face: 1.45, faceLine: 1.1, propLine: 0.75, fxLine: 1.4, reg: 0, brush: false, boil: 0.3, pad: 7, rim: 1.2 },
+  { id: 'wide', name: 'C · Sticker, wider slot', note: 'B in a slot 1.5× wider than tall, so flat poses and props (laptop, letter, sign) stop shrinking him.',
+    outline: 3, minOutline: 2, face: 1.45, faceLine: 1.1, propLine: 0.75, fxLine: 1.4, reg: 0, brush: false, boil: 0.3, pad: 7, rim: 1.2, aspect: 1.5 },
+];
+const DPR = 2;                       // render for Retina whatever this screen is
+const WING_PT = 31, ITEM_PT = 20;
+
+let W, L, mood = 'idle', cycle = true, tick = 0;
+
+/* --- style hooks inside lump.html: wobble, the brush double-stroke, face zoom, which part is drawing --- */
+const PATCH = `
+window.__mb = { face: 1, boil: 1, brush: true, part: 'body' };
+(() => {
+  const ob = boil; boil = (p, s, a) => ob(p, s, a * __mb.boil);
+  inkStroke = function (c, w) { c.lineWidth = w; c.stroke(); if (__mb.brush) { c.save(); c.translate(0.9, 1.1); c.lineWidth = w * 0.7; c.stroke(); c.restore(); } };
+  const mid = P => [P.reduce((s, p) => s + p[0], 0) / P.length, P.reduce((s, p) => s + p[1], 0) / P.length];
+  const zoomFace = (face, F) => {
+    const pts = [];
+    face.forEach(mk => { if (mk[0] === 'stroke' || mk[0] === 'mouth') pts.push(...mk[1]); else if (mk[0] !== 'blush') pts.push([mk[1], mk[2]]); });
+    if (!pts.length) return face;
+    const [cx, cy] = mid(pts), P = ([x, y]) => [cx + (x - cx) * F, cy + (y - cy) * F];
+    return face.map(mk => {
+      switch (mk[0]) {
+        case 'dot': case 'shine': case 'spiral': { const q = P([mk[1], mk[2]]); return [mk[0], q[0], q[1], mk[3] * F]; }
+        case 'oval': case 'blush': case 'lips': { const q = P([mk[1], mk[2]]); return [mk[0], q[0], q[1], mk[3] * F, mk[4] * F, mk[5]]; }
+        case 'teeth': { const q = P([mk[1], mk[2]]); return ['teeth', q[0], q[1], mk[3] * F, mk[4] * F]; }
+        case 'stroke': return ['stroke', mk[1].map(P), mk[2]];
+        case 'mouth': { const t = mk[2] && [...P([mk[2][0], mk[2][1]]), mk[2][2] * F, mk[2][3] * F]; return t ? ['mouth', mk[1].map(P), t] : ['mouth', mk[1].map(P)]; }
+      }
+      return mk;
+    });
+  };
+  const tag = (fn, part) => (...a) => { const was = __mb.part; __mb.part = part; try { return fn(...a); } finally { __mb.part = was; } };
+  const of = tag(drawFace, 'face');
+  drawFace = (c, d, seed) => of(c, __mb.face === 1 ? d : { ...d, face: zoomFace(d.face, __mb.face) }, seed);
+  drawFrontProps = tag(drawFrontProps, 'prop'); drawBackProps = tag(drawBackProps, 'prop');
+  drawFX = tag(drawFX, 'fx');
+})();`;
+
+function setStyle(V) { Object.assign(W.__mb, { face: V.face, boil: V.boil, brush: V.brush }); }
+
+// Wrap a context: map render()'s identity transform onto our crop, re-weight every line,
+// pull the off-register fill in, and skip the background and floor shadow.
+function wrap(ctx, V, k, ox, oy, line) {
+  let fills = 0;
+  const mult = { body: line, face: line * (V.faceLine || 1), prop: line * (V.propLine || 1), fx: line * (V.fxLine || 1) };
+  return new Proxy(ctx, {
+    get(t, p) {
+      if (p === 'setTransform') return () => t.setTransform(k, 0, 0, k, ox, oy);
+      if (p === 'fillRect') return (x, y, w, h) => { if (x === 0 && y === 0 && w === 240 && h === 240) return; t.fillRect(x, y, w, h); };
+      if (p === 'fill') return (...a) => { if (fills++ === 0) return; t.fill(...a); };
+      if (p === 'translate') return (x, y) => (x === 4 && y === 2.5) ? t.translate(4 * V.reg, 2.5 * V.reg) : t.translate(x, y);
+      const v = t[p]; return typeof v === 'function' ? v.bind(t) : v;
+    },
+    set(t, p, v) { if (p === 'lineWidth') v *= mult[W.__mb.part] || line; t[p] = v; return true; },
+  });
+}
+
+const loopLen = m => L.LOOPS[m].reduce((s, [, h]) => s + h, 0);
+// line: how much heavier than the original drawing the body outline is
+function paint(ctx, V, m, t, ink, k, ox, oy, noFX, line = 1) {
+  setStyle(V); L.setLine(ink); L.setTint(TINT);
+  L.render(wrap(ctx, V, k, ox, oy, line), m, L.at(m, t).id, t, { noFX, dim: false });
+}
+
+// The box his body and props cover across the whole loop (like bake.py), at the slot's aspect.
+const boxes = {};
+const off = document.createElement('canvas'); off.width = off.height = 240;
+const octx = off.getContext('2d', { willReadFrequently: true });
+function crop(V, m) {
+  const key = `${V.reg}|${m}`;
+  if (!boxes[key]) {
+    let x0 = 240, y0 = 240, x1 = 0, y1 = 0;
+    for (let t = 0; t < loopLen(m); t++) {
+      octx.setTransform(1, 0, 0, 1, 0, 0); octx.clearRect(0, 0, 240, 240);
+      paint(octx, V, m, t, 'glow', 1, 0, 0, true);
+      const d = octx.getImageData(0, 0, 240, 240).data;
+      for (let y = 0; y < 240; y++) for (let x = 0; x < 240; x++) if (d[(y * 240 + x) * 4 + 3] > 40) {
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+    }
+    boxes[key] = [x0, y0, x1, y1];
+  }
+  const [x0, y0, x1, y1] = boxes[key], a = V.aspect || 1;
+  let w = x1 - x0 + V.pad * 2, h = y1 - y0 + V.pad * 2;
+  if (w / h > a) h = w / a; else w = h * a;
+  return [(x0 + x1) / 2 - w / 2, (y0 + y1) / 2 - h / 2, w, h];
+}
+
+// A sticker keyline: his silhouette, grown by r px, laid under him.
+const tmp = document.createElement('canvas'), sil = document.createElement('canvas');
+function keyline(cv, r, colour) {
+  for (const c of [tmp, sil]) { c.width = cv.width; c.height = cv.height; }
+  const tc = tmp.getContext('2d'), sc = sil.getContext('2d'), c = cv.getContext('2d');
+  tc.drawImage(cv, 0, 0);
+  sc.drawImage(cv, 0, 0); sc.globalCompositeOperation = 'source-in'; sc.fillStyle = colour; sc.fillRect(0, 0, sil.width, sil.height);
+  c.setTransform(1, 0, 0, 1, 0, 0); c.clearRect(0, 0, cv.width, cv.height);
+  for (let i = 0; i < 16; i++) { const a = i / 16 * Math.PI * 2; c.drawImage(sil, Math.cos(a) * r, Math.sin(a) * r); }
+  c.drawImage(tmp, 0, 0);
+}
+
+// Today's path exactly: 240 px drawing -> 80 px baked frame -> scaled into the slot.
+const bake80 = document.createElement('canvas'); bake80.width = bake80.height = 80;
+const b80 = bake80.getContext('2d'); b80.imageSmoothingQuality = 'high';
+
+function draw(cv, V, m, t, ink) {
+  const c = cv.getContext('2d');
+  c.setTransform(1, 0, 0, 1, 0, 0); c.clearRect(0, 0, cv.width, cv.height);
+  const [x, y, w, h] = crop(V, m);
+  if (V.today) {
+    octx.setTransform(1, 0, 0, 1, 0, 0); octx.clearRect(0, 0, 240, 240);
+    paint(octx, V, m, t, ink, 1, 0, 0, false);
+    b80.clearRect(0, 0, 80, 80); b80.drawImage(off, x, y, w, h, 0, 0, 80, 80);
+    c.imageSmoothingQuality = 'high'; c.drawImage(bake80, 0, 0, cv.width, cv.height);
+    return;
+  }
+  const k = cv.height / h, px = Math.max(V.minOutline, V.outline * cv.height / (WING_PT * DPR));
+  paint(c, V, m, t, ink, k, -x * k, -y * k, false, px / (4 * k));     // the body outline is 4 units wide in lump.html
+  if (V.rim) keyline(cv, Math.max(1, V.rim * cv.height / (WING_PT * DPR)), ink === 'paper' ? '#FFFFFF' : '#000000');
+}
+
+function canvasAt(pt, aspect = 1) {
+  const cv = document.createElement('canvas');
+  cv.height = Math.round(pt * DPR); cv.width = Math.round(pt * DPR * aspect);
+  cv.style.height = pt + 'px'; cv.style.width = (pt * aspect) + 'px';
+  return cv;
+}
+
+/* --- page --- */
+const live = [];
+function buildLive() {
+  const host = document.getElementById('live');
+  for (const V of VARIANTS) {
+    const a = V.aspect || 1, row = document.createElement('div'); row.className = 'row';
+    row.innerHTML = `<div><div class="name">${V.name}</div><div class="note">${V.note}</div></div><div class="places"></div>`;
+    const places = row.querySelector('.places');
+    // notch wing
+    const wingCv = canvasAt(WING_PT - 2 + 2, a);
+    const wp = document.createElement('div'); wp.className = 'place';
+    wp.innerHTML = `<div class="bar wall"><div class="notch"></div><div class="wing"></div></div><small>Notch wing · 31 pt</small>`;
+    const wingEl = wp.querySelector('.wing'); wingEl.style.width = (WING_PT * a + 14) + 'px'; wingCv.style.marginTop = '1px';
+    wingEl.appendChild(wingCv); places.appendChild(wp);
+    live.push({ cv: wingCv, V, ink: 'glow' });
+    // menu bar item, dark and light
+    for (const [cls, ink, label] of [['dark', 'glow', 'Menu bar item · dark'], ['light', 'paper', 'Menu bar item · light']]) {
+      const cv = canvasAt(ITEM_PT, a), p = document.createElement('div'); p.className = 'place';
+      p.innerHTML = `<div class="menu ${cls}"><span class="slot"></span><span class="glyph"></span><span>Wed 25 Nov 9:41</span></div><small>${label} · 20 pt</small>`;
+      p.querySelector('.slot').appendChild(cv); places.appendChild(p);
+      live.push({ cv, V, ink });
+    }
+    host.appendChild(row);
+  }
+}
+
+function keyTick(m) {              // the longest-held drawing in the loop, a couple of ticks in
+  let t = 0, best = 0, at = 0;
+  for (const [, h] of L.LOOPS[m]) { if (h > best) { best = h; at = t + Math.min(3, h - 1); } t += h; }
+  return at;
+}
+function buildKeys() {
+  const g = document.getElementById('keys'); g.style.setProperty('--n', MOODS.length);
+  g.appendChild(document.createElement('div'));
+  for (const [, label] of MOODS) { const h = document.createElement('div'); h.className = 'head'; h.textContent = label; g.appendChild(h); }
+  for (const V of VARIANTS) {
+    const n = document.createElement('div'); n.className = 'vname'; n.textContent = V.name; g.appendChild(n);
+    for (const [m] of MOODS) {
+      const cell = document.createElement('div'); cell.className = 'cell';
+      const cv = document.createElement('canvas'); cv.height = WING_PT * DPR; cv.width = Math.round(WING_PT * DPR * (V.aspect || 1));
+      draw(cv, V, m, keyTick(m), 'glow');
+      cell.appendChild(cv); g.appendChild(cell);
+    }
+  }
+}
+
+function buildMoods() {
+  const host = document.getElementById('moods');
+  for (const [m, label] of MOODS) {
+    const b = document.createElement('button'); b.textContent = label; b.dataset.m = m;
+    b.onclick = () => { cycle = false; cyc.checked = false; setMood(m); };
+    host.appendChild(b);
+  }
+  const lab = document.createElement('label'); lab.innerHTML = '<input type="checkbox" id="cyc" checked> Cycle moods';
+  host.appendChild(lab);
+  const cyc = lab.querySelector('input'); cyc.onchange = () => { cycle = cyc.checked; };
+  setMood(mood);
+}
+function setMood(m) {
+  mood = m; tick = 0;
+  document.querySelectorAll('#moods button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.m === m)));
+}
+
+// lump.html keeps its code in a closure: load a copy with a hook that evals inside it.
+const frame = document.getElementById('src');
+fetch('lump.html').then(r => r.text()).then(src => {
+  frame.srcdoc = src.replace('<head>', '<head><base href="' + new URL('.', location.href) + '">')
+                    .replace('window.__lump = {', 'window.__lumpEval = code => eval(code);\nwindow.__lump = {');
+});
+frame.addEventListener('load', () => {
+  if (!frame.srcdoc) return;
+  W = frame.contentWindow; L = W.__lump;
+  W.__lumpEval(PATCH);
+  buildMoods(); buildLive(); buildKeys();
+  let since = performance.now();
+  setInterval(() => {
+    if (cycle && performance.now() - since > 5000) { since = performance.now(); setMood(MOODS[(MOODS.findIndex(x => x[0] === mood) + 1) % MOODS.length][0]); }
+    for (const x of live) draw(x.cv, x.V, mood, tick, x.ink);
+    tick++;
+  }, 1000 / 24);
+});
+</script>
+</body>
+</html>

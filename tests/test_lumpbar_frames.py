@@ -28,14 +28,24 @@ class Frames(unittest.TestCase):
         self.assertEqual(sorted(self.m["moods"]), sorted(moments))
 
     def test_strips_hold_every_frame_the_ticks_point_at(self):
-        size = self.m["size"]
-        for mood, info in self.m["moods"].items():
+        for mood, info in {**self.m["moods"], **(self.m.get("events") or {})}.items():
             self.assertTrue(info["ticks"], mood)
             self.assertEqual(max(info["ticks"]) + 1, info["frames"], mood)
-            for ink in ("glow", "paper"):
-                for layer in ("k", "w"):
-                    w, h = png_size(os.path.join(FRAMES, f"{mood}-{ink}-{layer}.png"))
-                    self.assertEqual((w, h), (size * info["frames"], size), f"{mood}-{ink}-{layer}")
+            for size, (fw, fh) in self.m["sizes"].items():
+                for ink in ("glow", "paper"):
+                    for layer in ("k", "w"):
+                        name = f"{mood}-{size}-{ink}-{layer}"
+                        self.assertEqual(png_size(os.path.join(FRAMES, name + ".png")), (fw * info["frames"], fh), name)
+
+    def test_both_slots_are_baked_wide_and_at_retina_size(self):
+        # the app picks "wing" beside the notch and "item" in the menu bar; both share one aspect
+        wing, item = self.m["sizes"]["wing"], self.m["sizes"]["item"]
+        self.assertAlmostEqual(wing[0] / wing[1], item[0] / item[1], places=1)
+        self.assertGreater(wing[0], wing[1])
+        self.assertGreaterEqual(item[1], 40)     # 20 pt menu bar item at 2x
+
+    def test_the_slack_plane_is_baked(self):
+        self.assertIn("tap_plane", self.m.get("events") or {})
 
 
 if __name__ == "__main__":
