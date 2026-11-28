@@ -735,6 +735,19 @@ class TwoAccounts(BridgeTest):
         self.assertEqual(self.b.usage["work:seven_day"]["pct"], 64)
 
 
+class UnreadLogging(BridgeTest):
+    """The log says why something was marked unread, and when looking at it cleared it."""
+    def test_unread_and_read_are_logged_with_what_you_were_looking_at(self):
+        self.hook("UserPromptSubmit", "abcdef123456")
+        with self.assertLogs("bridge", "INFO") as logs:
+            self.hook("Stop", "abcdef123456")
+        self.assertTrue(any("unread: abcdef12 finished while you were on another app" in l for l in logs.output), logs.output)
+        self.b.focus.front, self.b.focus.code_session = True, "abcdef123456"
+        with self.assertLogs("bridge", "INFO") as logs:
+            self.b.update()
+        self.assertTrue(any("read: abcdef12 is on screen" in l for l in logs.output), logs.output)
+
+
 class FocusAcrossAccounts(unittest.TestCase):
     """Which Code session is on screen, with both copies writing to the same log."""
     def setUp(self):
@@ -760,6 +773,12 @@ class FocusAcrossAccounts(unittest.TestCase):
         self.f._apply("local_bbb")                           # the work copy logged it in the background
         self.assertEqual(self.f.code_session, "cli-personal")
         self.assertEqual(self.f.focused["work"], "cli-work")
+
+    def test_where_names_the_copy_and_session(self):
+        self.f.set_front("work"); self.f._apply("local_bbb")
+        self.assertEqual(self.f.where(), "work app, Code session cli-work")
+        self.f.set_front(None)
+        self.assertEqual(self.f.where(), "another app")
 
     def test_null_clears_the_copy_in_front(self):
         self.f.set_front("work"); self.f._apply("local_bbb"); self.f._apply("null")

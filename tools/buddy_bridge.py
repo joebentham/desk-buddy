@@ -395,6 +395,13 @@ class Focus:
         acct, cli = self._cli_id(local)
         self.focused[acct or self.account or self.last_account] = cli
 
+    def where(self):
+        """What you're looking at, for the log: "personal app, Code session 1a2b3c4d", "another app"..."""
+        if not self.front:
+            return "another app"
+        sid = self.code_session
+        return f"{self.account} app, " + (f"Code session {sid[:8]}" if sid else "no Code session")
+
     def set_front(self, account):
         """account: the Claude copy now in front, or None when another app is."""
         self.front, self.account = account is not None, account
@@ -441,6 +448,10 @@ class Focus:
                                       capture_output=True, text=True, timeout=2).stdout
                 self.set_front(self._front_account(info))
                 self._poll_log()
+                now_at = self.where()
+                if now_at != getattr(self, "_logged", None):   # so a wrong "unread" can be traced later
+                    self._logged = now_at
+                    log.info("looking at: %s", now_at)
             except Exception as e:
                 log.info("focus check failed: %s", e)
             time.sleep(1.5)
@@ -913,6 +924,7 @@ class Buddy:
             watching = self.on_screen_locked(s)
             if not watching:
                 s["unseen"] = now                   # finished while you weren't looking at it
+                log.info("unread: %s finished while you were on %s", self.sid_of(s)[:8], self.focus_where())
             # celebrate briefly if other things are still going on, longer if it's all quiet
             busy = self.base_locked(now, skip=s) in ("alert", "working")
             self.celebrate_until = max(self.celebrate_until, now + (CELEBRATE_SECS if busy else DONE_SECS))
@@ -973,6 +985,13 @@ class Buddy:
             log.info("sound %s skipped: night and you've been away", moment); return False
         return self.sounds.play(moment)
 
+    def sid_of(self, s):
+        return next((k for k, v in self.sessions.items() if v is s), "?")
+
+    def focus_where(self):
+        where = getattr(self.focus, "where", None)
+        return where() if where else ("the Claude app" if self.focus.front else "another app")
+
     def on_screen_locked(self, s):
         """Is this session's conversation showing in the Claude app, with the app in front?"""
         if not self.focus.front:
@@ -988,6 +1007,7 @@ class Buddy:
         for s in self.sessions.values():
             if s.get("unseen") and self.on_screen_locked(s):
                 s.pop("unseen", None)
+                log.info("read: %s is on screen", self.sid_of(s)[:8])
 
     def _effective(self, s, now):
         st, age = s["state"], now - s["t"]
