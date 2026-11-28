@@ -3,6 +3,7 @@
 Run it yourself with the board plugged into the Mac by USB (data cable):
     ~/.desk-buddy/venv/bin/python tools/wifi_setup.py          # set up / change network
     ~/.desk-buddy/venv/bin/python tools/wifi_setup.py --forget # turn Wi-Fi off again
+On Windows: ~/.desk-buddy/venv/Scripts/python tools/wifi_setup.py (same options).
 
 It asks for the network name and password (the password isn't shown, logged or saved on the Mac:
 it goes straight over USB into the board's own flash), makes a pairing token so only your
@@ -14,15 +15,59 @@ import getpass, glob, json, os, re, secrets, subprocess, sys, time
 
 import serial
 
+IS_WIN = sys.platform == "win32"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOME = os.path.expanduser("~/.desk-buddy")
 CONFIG = os.path.join(HOME, "config.json")
 BRIDGE = "com.deskbuddy.bridge"
 BRIDGE_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{BRIDGE}.plist")
 
 
+def _posix_offset(minutes_west):
+    """POSIX offset text: hours west of UTC, with :mm when needed (e.g. 300 -> "5", -330 -> "-5:30")."""
+    sign = "-" if minutes_west < 0 else ""
+    h, m = divmod(abs(int(minutes_west)), 60)
+    return f"{sign}{h}" + (f":{m:02d}" if m else "")
+
+
+def posix_tz_from_windows(bias, std_bias, dst_bias, std_date, dst_date):
+    """A POSIX rule from Windows' time zone details (TIME_ZONE_INFORMATION): biases are minutes west of
+    UTC, dates are (month, week 1-5 where 5 = last, weekday 0 = Sunday, hour); month 0 means no DST."""
+    rule = "STD" + _posix_offset(bias + std_bias)
+    if dst_date[0] == 0 or std_date[0] == 0:
+        return rule
+    when = lambda d: f"M{d[0]}.{d[1]}.{d[2]}/{d[3]}"
+    return rule + "DST" + _posix_offset(bias + dst_bias) + "," + when(dst_date) + "," + when(std_date)
+
+
+def windows_posix_tz():
+    """Windows: your time zone as a POSIX rule, from GetTimeZoneInformation."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SYSTEMTIME(ctypes.Structure):
+            _fields_ = [(n, wintypes.WORD) for n in ("wYear", "wMonth", "wDayOfWeek", "wDay", "wHour", "wMinute", "wSecond", "wMilliseconds")]
+
+        class TZI(ctypes.Structure):
+            _fields_ = [("Bias", wintypes.LONG), ("StandardName", wintypes.WCHAR * 32), ("StandardDate", SYSTEMTIME),
+                        ("StandardBias", wintypes.LONG), ("DaylightName", wintypes.WCHAR * 32), ("DaylightDate", SYSTEMTIME),
+                        ("DaylightBias", wintypes.LONG)]
+
+        tzi = TZI()
+        if ctypes.windll.kernel32.GetTimeZoneInformation(ctypes.byref(tzi)) == 0xFFFFFFFF:
+            return ""
+        d = lambda t: (t.wMonth, t.wDay, t.wDayOfWeek, t.wHour)
+        return posix_tz_from_windows(tzi.Bias, tzi.StandardBias, tzi.DaylightBias, d(tzi.StandardDate), d(tzi.DaylightDate))
+    except Exception:
+        return ""
+
+
 def posix_tz():
     """Your time zone as a POSIX rule (e.g. EST5EDT,M3.2.0,M11.1.0), from the footer of
     /etc/localtime, which is what the ESP32's clock understands."""
+    if IS_WIN:
+        return windows_posix_tz()
     try:
         data = open("/etc/localtime", "rb").read()
         footer = data.rstrip(b"\n").rsplit(b"\n", 1)[-1].decode()
@@ -32,6 +77,13 @@ def posix_tz():
 
 
 def current_ssid():
+    if IS_WIN:
+        try:
+            out = subprocess.run(["netsh", "wlan", "show", "interfaces"], capture_output=True, text=True, timeout=3).stdout
+            m = re.search(r"^\s*SSID\s*: (.+)$", out, re.M)
+            return m.group(1).strip() if m else ""
+        except Exception:
+            return ""
     try:
         out = subprocess.run(["ipconfig", "getsummary", "en0"], capture_output=True, text=True, timeout=3).stdout
         m = re.search(r"^\s*SSID : (.+)$", out, re.M)
@@ -56,14 +108,32 @@ def read_lines(ser, until, secs):
     return None
 
 
+def usb_ports():
+    if IS_WIN:                                  # the board's USB-serial chip: WCH CH343
+        from serial.tools import list_ports
+        return sorted(p.device for p in list_ports.comports() if (p.vid, p.pid) == (0x1A86, 0x55D3))
+    return sorted(glob.glob("/dev/cu.usbmodem*"))
+
+
+def bridge_ctl(start):
+    """Pause the bridge (it holds the USB port) or start it again."""
+    if IS_WIN:
+        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                        os.path.join(ROOT, "tools", "windows", "bridge.ps1"), "-Start" if start else "-Stop"], capture_output=True)
+    elif start:
+        subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", BRIDGE_PLIST], capture_output=True)
+    else:
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{BRIDGE}"], capture_output=True)
+
+
 def main():
     forget = "--forget" in sys.argv
-    ports = sorted(glob.glob("/dev/cu.usbmodem*"))
+    ports = usb_ports()
     if not ports:
         sys.exit("Lump isn't plugged in by USB (needs a data cable).")
     cfg = {}
     if os.path.exists(CONFIG):
-        with open(CONFIG) as f:
+        with open(CONFIG, encoding="utf-8") as f:
             cfg = json.load(f)
 
     if forget:
@@ -81,7 +151,7 @@ def main():
         line = f"w {ssid}\t{password}\t{token}\t{tz}"
 
     # the bridge holds the USB port: pause it while we talk to the board
-    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{BRIDGE}"], capture_output=True)
+    bridge_ctl(start=False)
     time.sleep(1)
     try:
         ser = serial.Serial(); ser.port, ser.baudrate, ser.timeout = ports[0], 115200, 0.3
@@ -99,7 +169,7 @@ def main():
             cfg["lump_token"] = token
             cfg.setdefault("lump_host", "lump.local")
             os.makedirs(HOME, exist_ok=True)
-        with open(CONFIG + ".tmp", "w") as f:
+        with open(CONFIG + ".tmp", "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
         os.replace(CONFIG + ".tmp", CONFIG)
         if forget:
@@ -116,13 +186,13 @@ def main():
             time.sleep(1)
         ser.close()
         if status and "wifi=connected" in status:
-            print("\nLump is on Wi-Fi. Unplug him from the Mac and power him from any USB charger:")
+            print(f"\nLump is on Wi-Fi. Unplug him from the {'PC' if IS_WIN else 'Mac'} and power him from any USB charger:")
             print("the bridge will find him at lump.local within a few seconds.")
         else:
             print("\nHe saved the details but hasn't joined yet. Check the network name and password")
             print("(and that it's a 2.4 GHz network), then run this again.")
     finally:
-        subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", BRIDGE_PLIST], capture_output=True)
+        bridge_ctl(start=True)
 
 
 if __name__ == "__main__":
