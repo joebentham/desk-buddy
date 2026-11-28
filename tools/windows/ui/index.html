@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lump Control</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app">
+  <aside class="panel" aria-label="What Lump is showing">
+    <div class="panel-top">
+      <span class="brand">Lump Control</span>
+      <span class="live" id="live"><span class="dot"></span><span id="live-text">Connecting…</span></span>
+    </div>
+    <div class="hero">
+      <div class="screen" id="halo">
+        <canvas id="lump" width="240" height="240" role="img" aria-label="Lump, as he is on the display"></canvas>
+      </div>
+      <div class="mood" id="mood">…</div>
+      <div class="link" id="link"></div>
+      <button class="btn primary hidden" id="start-bridge" type="button">Start the bridge</button>
+    </div>
+    <div class="stats">
+      <div class="stat"><span class="num" id="n-working">0</span><span class="lbl">working</span></div>
+      <div class="stat"><span class="num" id="n-alert">0</span><span class="lbl">need you</span></div>
+      <div class="stat"><span class="num" id="n-unseen">0</span><span class="lbl">unseen</span></div>
+    </div>
+    <div class="usage" id="usage" aria-label="Claude usage"></div>
+  </aside>
+
+  <main class="content">
+    <div class="topbar">
+      <div class="tabs" role="tablist" aria-label="Sections">
+        <button role="tab" class="tab" data-tab="status" aria-selected="true" type="button">Status</button>
+        <button role="tab" class="tab" data-tab="play" aria-selected="false" type="button">Play</button>
+        <button role="tab" class="tab" data-tab="sounds" aria-selected="false" type="button">Sounds</button>
+        <button role="tab" class="tab" data-tab="settings" aria-selected="false" type="button">Settings</button>
+      </div>
+      <button class="icon-btn" id="theme" type="button" aria-label="Switch to light mode" title="Switch to light mode">
+        <svg class="sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>
+        <svg class="moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"></path></svg>
+      </button>
+    </div>
+
+    <section class="page" id="page-status" role="tabpanel" aria-label="Status">
+      <h2 class="section-title">Sessions</h2>
+      <div class="list" id="sessions"></div>
+      <div class="empty hidden" id="no-sessions">No Claude sessions right now.</div>
+      <div class="row-actions">
+        <button class="btn" type="button" data-bridge="restart">Restart bridge</button>
+        <button class="btn" type="button" data-open="log">Open log</button>
+        <button class="btn" type="button" data-open="folder">Open folder</button>
+      </div>
+    </section>
+
+    <section class="page hidden" id="page-play" role="tabpanel" aria-label="Play">
+      <h2 class="section-title">Gags and fidgets</h2>
+      <div class="tiles" id="animations"></div>
+      <h2 class="section-title">Preview a mood</h2>
+      <div class="tiles" id="moods"></div>
+      <div class="row-actions">
+        <button class="btn" type="button" id="showcase">Showcase every mood</button>
+        <button class="btn" type="button" id="back-live">Back to live</button>
+      </div>
+      <div class="spacer"></div>
+      <div class="bar-card">
+        <label for="tap">Tap sensitivity</label>
+        <input id="tap" type="range" min="0.1" max="1.5" step="0.01">
+        <span class="value" id="tap-value">0.35 g</span>
+        <button class="btn primary" type="button" id="tap-apply">Apply</button>
+        <button class="btn" type="button" id="tap-default">Default</button>
+      </div>
+    </section>
+
+    <section class="page hidden" id="page-sounds" role="tabpanel" aria-label="Sounds">
+      <div class="card">
+        <label class="switch-row"><span>Lump makes sounds</span><input type="checkbox" class="switch" id="snd-on"></label>
+        <label class="switch-row"><span>Quiet at night unless you've been around</span><input type="checkbox" class="switch" id="snd-quiet"></label>
+        <div class="slider-row">
+          <label for="snd-vol">Volume</label>
+          <input id="snd-vol" type="range" min="0.1" max="2" step="0.05">
+          <span class="value" id="snd-vol-value"></span>
+          <button class="btn" type="button" id="snd-test">Test</button>
+        </div>
+      </div>
+      <h2 class="section-title">Moments</h2>
+      <div class="list" id="moments"></div>
+    </section>
+
+    <section class="page hidden" id="page-settings" role="tabpanel" aria-label="Settings">
+      <div class="card">
+        <h2 class="card-title">Body color</h2>
+        <div class="swatches" id="swatches"></div>
+        <div class="row-actions tight">
+          <label class="btn picker">Pick any color…<input type="color" id="colour-pick"></label>
+          <button class="btn" type="button" id="colour-reset">Tangerine</button>
+        </div>
+        <p class="note">Usage warnings and meeting countdowns still blend from it.</p>
+      </div>
+      <div class="card">
+        <h2 class="card-title">Claude apps</h2>
+        <p class="note">Every Claude desktop app here has its own usage limits. Lump turns red for whichever is closest. A copy started with its own data folder shows up here by itself while it runs; name it and save to keep it.</p>
+        <div class="apps" id="apps"></div>
+        <div class="row-actions tight">
+          <button class="btn" type="button" id="apps-add">Add a data folder…</button>
+          <button class="btn primary" type="button" id="apps-save">Save</button>
+        </div>
+      </div>
+      <form class="card form" id="settings-form">
+        <h2 class="card-title">Lump's connection</h2>
+        <label>Wi-Fi host<input type="text" name="lump_host" placeholder="lump.local"></label>
+        <p class="note" id="pairing"></p>
+        <h2 class="card-title">Calendar</h2>
+        <label>Private iCal link<input type="password" name="calendar_ics" autocomplete="off"></label>
+        <label>Your email<input type="text" name="my_email" placeholder="Skips meetings you've declined"></label>
+        <h2 class="card-title">Slack</h2>
+        <label>User token (xoxp-…)<input type="password" name="slack_token" autocomplete="off"></label>
+        <label>VIPs<input type="text" name="slack_vips" placeholder="Names as Slack shows them, comma separated"></label>
+        <label>Letter lasts (minutes)<input type="text" name="slack_vip_minutes" inputmode="decimal"></label>
+        <div class="row-actions tight"><button class="btn primary" type="submit">Save</button><span class="note">The bridge picks up changes by itself.</span></div>
+      </form>
+    </section>
+
+    <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
